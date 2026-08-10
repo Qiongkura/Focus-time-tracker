@@ -1,0 +1,9 @@
+{
+  "data_dir": "data",
+  "poll_interval_seconds": 1.0,
+  "min_session_seconds": 3,
+  "exclude_processes": [
+    "python.exe"
+  ],
+  "browser_site_tracking": true
+}
