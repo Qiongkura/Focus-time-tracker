@@ -15,6 +15,7 @@ from . import theme, tray
 from .config import project_root
 from .db import UsageDB
 from .monitor import get_foreground_info  # 仅用于“当前前台窗口”预览，不参与计时
+from .overrides import override_for, remove_override, set_override
 from .utils import fmt_minsec
 from .widgets import (
     FlowFrame, NavButton, ProgressBar, RoundedButton, RoundedCard, ScrollArea,
@@ -443,7 +444,8 @@ class ScreenTimeApp:
         return {"icon": icon,
                 "name": name if full_name else _shorten(name, 18),
                 "seconds": a["seconds"],
-                "category": a["category"]}
+                "category": a["category"],
+                "process": a["process"]}
 
     def _site_item(self, s, full_name=False):
         return {"icon": get_globe_icon(40),
@@ -451,21 +453,21 @@ class ScreenTimeApp:
                 "seconds": s["seconds"], "category": "网站"}
 
     def _sync_card(self, card, card_key, items, total, fill, bar_color,
-                   show_pct=False, full_name=False):
+                   show_pct=False, full_name=False, actions=False):
         width = max(theme.scale(280), card.winfo_width() - theme.scale(32))
         sig = (width, [it["name"] for it in items])
         if self._rows_sig.get(card_key) != sig:
             self._rows_sig[card_key] = sig
             card.delete("rowwin")
             self._build_card_rows(card, card_key, items, fill, bar_color, width,
-                                  show_pct, full_name)
+                                  show_pct, full_name, actions)
             # 重建后立即填充时长/进度，不用等下一个刷新周期
             self._update_card_rows(card_key, items, total, show_pct, full_name)
         else:
             self._update_card_rows(card_key, items, total, show_pct, full_name)
 
     def _build_card_rows(self, card, card_key, items, fill, bar_color, width,
-                         show_pct=False, full_name=False):
+                         show_pct=False, full_name=False, actions=False):
         rows = []
         if not items:
             items = [{"icon": None, "name": "暂无数据", "seconds": 0, "category": ""}]
@@ -483,23 +485,47 @@ class ScreenTimeApp:
                               height=8, fill=bar_color)
             time_lbl = tk.Label(row, text="", font=theme.font(9), fg=theme.SUB,
                                 bg=fill, anchor="e")
+            actions_frame = None
+            extra_h = 0
+            if actions and it.get("process") and it.get("category") in ("应用", "游戏"):
+                proc = it["process"]
+                target = "游戏" if it["category"] == "应用" else "应用"
+                actions_frame = tk.Frame(row, bg=fill)
+                RoundedButton(
+                    actions_frame, text=f"移到{target}",
+                    command=self._make_mover(proc, target), width=64, height=22,
+                    radius=5, fill=theme.ACCENT_LIGHTER, fg=theme.ACCENT,
+                    bg=fill, font=theme.font(8, True),
+                ).pack(side="left", padx=(0, theme.scale(6)))
+                if override_for(proc):
+                    RoundedButton(
+                        actions_frame, text="还原自动",
+                        command=self._make_mover(proc, None), width=64, height=22,
+                        radius=5, fill=theme.SECONDARY_BG, fg=theme.SUB,
+                        bg=fill, font=theme.font(8, True),
+                    ).pack(side="left")
+                extra_h = theme.scale(26)
             # 名称换行到多行时行高自动加高，保证名称、时间条、百分比完整显示
             # 余量需覆盖：名称上方留白 + 第二行时间条/时长标签高度
-            row_h = max(theme.scale(58), name_lbl.winfo_reqheight() + theme.scale(36))
+            row_h = max(theme.scale(58), name_lbl.winfo_reqheight() + theme.scale(36)) + extra_h
             row.configure(height=row_h)
             row.grid_propagate(False)
             # 两行布局：名称与时间条同列（左对齐），时间条列弹性伸缩
-            icon_lbl.grid(row=0, column=0, rowspan=2,
+            icon_lbl.grid(row=0, column=0, rowspan=3 if actions_frame else 2,
                           padx=(theme.scale(16), theme.scale(10)), pady=theme.scale(6))
             name_lbl.grid(row=0, column=1, columnspan=2, sticky="w",
                           padx=(0, theme.scale(16)), pady=(theme.scale(8), 0))
             bar.grid(row=1, column=1, sticky="ew", pady=(0, theme.scale(6)))
             time_lbl.grid(row=1, column=2, sticky="e",
                           padx=(theme.scale(8), theme.scale(16)), pady=(0, theme.scale(6)))
+            if actions_frame:
+                actions_frame.grid(row=2, column=1, columnspan=2, sticky="e",
+                                   padx=(0, theme.scale(16)), pady=(2, theme.scale(4)))
             row.grid_columnconfigure(1, weight=1)  # 时间条列吸收窗口缩放
             card.create_window(theme.scale(16), y, window=row, anchor="nw",
                                width=width, tags="rowwin")
-            rows.append({"icon": icon_lbl, "name": name_lbl, "bar": bar, "time": time_lbl})
+            rows.append({"icon": icon_lbl, "name": name_lbl, "bar": bar, "time": time_lbl,
+                         "actions": actions_frame})
             y += row_h + theme.scale(6)
         self._card_rows[card_key] = rows
         # 记录卡片内容总高度（头部 + 各行实际高度 + 底部留白），供卡片高度自适应
@@ -624,7 +650,6 @@ class ScreenTimeApp:
         self._stats_drawing = False
         self._stats_redraw_timer = None
         self.stats_container.bind("<Configure>", self._stats_on_configure)
-        # 删除 self.stats_scroll，后面所有用到 self.stats_scroll.refresh_scroll() 全部删掉！
 
     def _stats_on_configure(self, event):
         if self._stats_drawing or self.current_page != "stats":
@@ -666,9 +691,26 @@ class ScreenTimeApp:
                 canvas = FigureCanvasTkAgg(fig, master=frame)
                 tk_widget = canvas.get_tk_widget()
                 tk_widget.pack(anchor="nw")
+                # matplotlib 默认在画布首次 <Map> 时按 DPI 把控件尺寸改成物理像素
+                # （高 DPI 下约 1.5 倍），会覆盖 _draw_stats_impl 强制设置的固定尺寸，
+                # 导致图表被撑大、只显示左上角一部分。这里接管 <Map>，尺寸始终由我们控制。
+                tk_widget.bind("<Map>", self._on_stats_canvas_map)
                 self._stats_canvases.append(canvas)
                 self._stats_frames.append(frame)
         return self._stats_figs, self._stats_canvases
+
+    def _on_stats_canvas_map(self, _event=None):
+        """画布重新显示时（切页/重排），重新套用最近一次绘制的固定尺寸。"""
+        if not self._stats_fixed_size:
+            return
+        fig_w, heights = self._stats_fixed_size
+        factor = theme.scale(1.0)
+        for i, canvas in enumerate(self._stats_canvases):
+            fig_h = max(int(120 * factor), heights[i])
+            try:
+                canvas.get_tk_widget().config(width=fig_w, height=fig_h)
+            except tk.TclError:
+                pass
 
     def _draw_stats(self, force=False):
         if self._stats_drawing:
@@ -695,7 +737,9 @@ class ScreenTimeApp:
             container_w = int(root_w - theme.scale(theme.SIDEBAR_WIDTH) - theme.scale(48))
         if root_w <= 100 or root_h <= 100:
             return
-        fig_w = int(max(theme.scale(680), container_w - theme.scale(8)))
+        # 下限取 480*scale：最小窗口（760*scale）下容器仍有约 552*scale 宽，
+        # 保证 fig_w 永远不会超过容器，避免画布被 pack 压缩、图表只显示左上角
+        fig_w = int(max(theme.scale(480), container_w - theme.scale(8)))
         avail_h = int(root_h - theme.scale(96))
         total_h = max(int(200 * factor), avail_h - 110)
         heights = (int(total_h * 0.56), int(total_h * 0.42))
@@ -713,10 +757,6 @@ class ScreenTimeApp:
         for canvas in canvases:
             canvas.draw_idle()
             canvas.get_tk_widget().update_idletasks()
-        try:
-            self.stats_scroll.refresh_scroll()
-        except Exception:
-            pass
 
     def _hourly_usage(self, start, end):
         rows = self.db.conn.execute(
@@ -1060,6 +1100,9 @@ class ScreenTimeApp:
         tk.Label(inner, text="分类", font=theme.font(22, True), fg=theme.TEXT_TITLE,
                  bg=theme.BG).pack(anchor="w", padx=theme.scale(28),
                                    pady=(theme.scale(32), theme.scale(16)))
+        tk.Label(inner, text="提示：点击进程右侧按钮可手动调整“应用 / 游戏”，手动设置永久优先于自动识别",
+                 font=theme.font(9), fg=theme.SUB, bg=theme.BG).pack(
+            anchor="w", padx=theme.scale(28), pady=(0, theme.scale(12)))
         self.cat_grid = tk.Frame(inner, bg=theme.BG)
         self.cat_grid.pack(fill="x", padx=theme.scale(28), pady=(0, theme.scale(24)))
         self.cat_grid.bind("<Configure>", lambda _e: self._relayout_categories())
@@ -1164,19 +1207,46 @@ class ScreenTimeApp:
             cnt = cats.get(cat, {}).get("count", 0)
             pct = secs / total_all * 100
             widgets["total"].config(text=f"共 {fmt_minsec(secs)} · 占 {pct:.0f}%")
+            key = f"分类-{cat}"
             if cat == "网站":
                 items = [self._site_item(s, full_name=True) for s in sites]  # 全部网站
+                self._sync_card(widgets["card"], key, items, secs, "#FFFFFF",
+                                theme.CATEGORY_META[cat][1], show_pct=True, full_name=True)
             else:
                 items = [self._process_item(a, full_name=True) for a in apps
                          if a["category"] == cat]  # 全部进程
-            key = f"分类-{cat}"
-            # 与首页完全相同的行渲染管线，保证显示效果一致
-            self._sync_card(widgets["card"], key, items, secs, "#FFFFFF",
-                            theme.CATEGORY_META[cat][1], show_pct=True, full_name=True)
-            # 卡片高度按各行实际高度累加（名称换行时行高自动加高），保证完整显示
+                # 与首页完全相同的行渲染管线，保证显示效果一致；进程行附带移动按钮
+                self._sync_card(widgets["card"], key, items, secs, "#FFFFFF",
+                                theme.CATEGORY_META[cat][1], show_pct=True, full_name=True,
+                                actions=True)
+            # 卡片高度按各行实际高度累加（名称换行时行高自动加高），保证全部进程/网站完整显示
             h = self._card_heights.get(key)
             if h:
                 widgets["card"].configure(height=int(h))
+
+    def _make_mover(self, process: str, target: str | None):
+        """生成分类移动按钮回调（target=None 表示还原为自动识别）。"""
+        return lambda: self._move_process(process, target)
+
+    def _move_process(self, process: str, target: str | None):
+        """手动把进程归到 应用/游戏，并同步重分类历史记录。"""
+        try:
+            if target in ("应用", "游戏"):
+                set_override(process, target)
+            else:
+                remove_override(process)
+                self.db.reclassify_process(process)
+            self.db.apply_overrides()
+        except Exception as exc:  # noqa: BLE001
+            self._log_error("move_process", exc)
+            return
+        # 覆盖状态变化会影响按钮显示，强制重建分类页三卡
+        for key in ("分类-应用", "分类-游戏", "分类-网站"):
+            self._rows_sig.pop(key, None)
+        try:
+            self._refresh_categories(self._period_start(), datetime.now())
+        except Exception as exc:  # noqa: BLE001
+            self._log_error("move_refresh", exc)
 
     # ---------- 设置页 ----------
     def _build_settings(self):
@@ -1354,12 +1424,16 @@ class ScreenTimeApp:
 
     # ---------- 后台采集子进程 ----------
     def _spawn_background(self):
-        """GUI 启动后自动拉起独立后台采集进程（main.py start）。"""
+        """GUI 启动后自动拉起独立后台采集进程（start 模式；打包成 exe 后调用 exe 自身）。"""
         if self._background_running():
             return
         try:
+            if getattr(sys, "frozen", False):
+                cmd = [sys.executable, "start"]
+            else:
+                cmd = [sys.executable, "main.py", "start"]
             self._bg_proc = subprocess.Popen(
-                [sys.executable, "main.py", "start"],
+                cmd,
                 cwd=str(project_root()),
                 creationflags=0x08000000,  # CREATE_NO_WINDOW
             )
@@ -1478,8 +1552,22 @@ class ScreenTimeApp:
             self.root.after_idle(self.refresh)
         except tk.TclError:
             pass
-        # 全局窗口缩放时，强制重置统计图尺寸缓存、启动防抖重绘
-        
+        # 全局窗口缩放时，强制重置统计图尺寸缓存、启动防抖重绘，
+        # 否则画布沿用旧尺寸，切回统计页时只显示左上角一部分
+        if getattr(self, "_stats_figs", None) is None:
+            return
+        new_size = (self.root.winfo_width(), self.root.winfo_height())
+        if getattr(self, "_stats_root_size", None) == new_size:
+            return
+        self._stats_root_size = new_size
+        self._stats_fixed_size = None
+        if getattr(self, "_stats_redraw_timer", None):
+            try:
+                self.root.after_cancel(self._stats_redraw_timer)
+            except tk.TclError:
+                pass
+        if self.current_page == "stats":
+            self._stats_redraw_timer = self.root.after(60, self._draw_stats)
 
     def refresh(self):
         # 布局诊断：每 20 次刷新记录一次真实尺寸

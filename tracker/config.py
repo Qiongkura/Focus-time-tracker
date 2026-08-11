@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import sys
 from pathlib import Path
 
 DEFAULTS = {
@@ -24,5 +25,7 @@ def load_config(path: Path) -> dict:
 
 
 def project_root() -> Path:
-    """项目根目录（main.py 所在目录）。"""
+    """项目根目录：源码运行时为 main.py 所在目录；打包成 exe 后为 exe 所在目录。"""
+    if getattr(sys, "frozen", False):
+        return Path(sys.executable).resolve().parent
     return Path(__file__).resolve().parent.parent

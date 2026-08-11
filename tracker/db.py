@@ -83,10 +83,65 @@ class UsageDB:
             "AND lower(process) IN (?, ?, ?)",
             _BROWSER_PROCESSES,
         )
-        self.conn.execute(
-            "UPDATE sessions SET category='游戏' WHERE category='应用' AND instr(lower(exe_path), 'steamapps') > 0"
-        )
+        self._backfill_games()
+        self.apply_overrides()
         self.conn.commit()
+
+    def _backfill_games(self):
+        """用游戏规则引擎回填旧数据：把能识别为游戏的“应用”会话改为“游戏”。"""
+        from .games import is_game
+
+        rows = self.conn.execute(
+            "SELECT id, process, exe_path, window_title FROM sessions WHERE category='应用'"
+        ).fetchall()
+        game_ids = [r[0] for r in rows if is_game(r[2], r[1], r[3])]
+        for i in range(0, len(game_ids), 400):
+            chunk = game_ids[i:i + 400]
+            marks = ",".join("?" * len(chunk))
+            self.conn.execute(
+                f"UPDATE sessions SET category='游戏' WHERE id IN ({marks})", chunk
+            )
+
+    def apply_overrides(self):
+        """把手动分类覆盖应用到已有记录（只影响 应用/游戏 两类，网站/系统不动）。"""
+        from .overrides import all_overrides
+
+        overrides = all_overrides()
+        if not overrides:
+            return
+        with self._lock:
+            for process, category in overrides.items():
+                self.conn.execute(
+                    "UPDATE sessions SET category=? WHERE lower(process)=? "
+                    "AND category IN ('应用', '游戏')",
+                    (category, process),
+                )
+            self.conn.commit()
+
+    def reclassify_process(self, process: str):
+        """清除手动覆盖后，按规则引擎重新判定某进程已有记录的 应用/游戏 分类。"""
+        from .games import is_game
+        from .overrides import override_for
+
+        name = (process or "").strip().lower()
+        if not name or override_for(process):
+            return
+        with self._lock:
+            rows = self.conn.execute(
+                "SELECT id, exe_path, window_title FROM sessions "
+                "WHERE lower(process)=? AND category IN ('应用', '游戏')",
+                (name,),
+            ).fetchall()
+            game_ids = [r[0] for r in rows if is_game(r[1], process, r[2])]
+            app_ids = [r[0] for r in rows if not is_game(r[1], process, r[2])]
+            for ids, category in ((game_ids, "游戏"), (app_ids, "应用")):
+                if ids:
+                    marks = ",".join("?" * len(ids))
+                    self.conn.execute(
+                        f"UPDATE sessions SET category=? WHERE id IN ({marks})",
+                        [category] + ids,
+                    )
+            self.conn.commit()
 
     def add_session(self, start: datetime, end: datetime, process: str, exe_path: str = "",
                     title: str = "", category: str = "应用", site: str = "", url: str = "") -> None:

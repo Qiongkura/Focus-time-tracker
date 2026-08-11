@@ -1,0 +1,41 @@
+{
+  "replace_defaults": false,
+  "path_keywords": [
+    "steamapps",
+    "riot games",
+    "epic games",
+    "battle.net",
+    "battlenet",
+    "blizzard",
+    "ubisoft",
+    "ea games",
+    "electronic arts",
+    "gog galaxy",
+    "wegame",
+    "rail_apps",
+    "hoyoplay",
+    "mihoyo",
+    "hoyoverse",
+    "rockstar games",
+    "2k games",
+    "netease"
+  ],
+  "process_exact": [
+    "valorant.exe",
+    "leagueclient.exe",
+    "league of legends.exe",
+    "genshinimpact.exe",
+    "starrail.exe"
+  ],
+  "process_suffix": [
+    "-win64-shipping.exe",
+    "-win32-shipping.exe"
+  ],
+  "exclude_path_keywords": [
+    "cloudmusic",
+    "youdao",
+    "wechat",
+    "qq\\"
+  ],
+  "exclude_process_exact": []
+}

@@ -9,6 +9,8 @@ from datetime import datetime
 from pathlib import Path
 
 from .browser import resolve_site
+from .games import is_game
+from .overrides import override_for
 
 if os.name != "nt":
     raise RuntimeError("本工具仅支持 Windows（依赖 Win32 API 获取前台窗口）")
@@ -59,8 +61,8 @@ def _process_name_of(pid: int):
         kernel32.CloseHandle(handle)
 
 
-def get_foreground_info():
-    """返回当前前台窗口信息（含分类与网站）；无窗口时返回 None。"""
+def _collect_window() -> dict | None:
+    """Win32 采集原始前台窗口数据；无窗口时返回 None。测试可替换此函数。"""
     hwnd = user32.GetForegroundWindow()
     if not hwnd:
         return None
@@ -80,7 +82,22 @@ def get_foreground_info():
     minimized = bool(user32.IsIconic(hwnd))
     process, exe_path = _process_name_of(pid.value)
 
-    # 分类：系统（桌面/锁屏/最小化） > 游戏（Steam） > 网站（浏览器） > 应用
+    return {
+        "hwnd": hwnd,
+        "pid": pid.value,
+        "process": process,
+        "exe_path": exe_path,
+        "title": title,
+        "class_name": class_name,
+        "minimized": minimized,
+    }
+
+
+def classify_window(process: str = "", exe_path: str = "", title: str = "",
+                    class_name: str = "", minimized: bool = False,
+                    hwnd: int = 0, pid: int = 0) -> dict:
+    """纯分类逻辑：系统（桌面/锁屏/最小化） > 手动覆盖 > 游戏（规则引擎） > 网站 > 应用。"""
+    # 分类：系统（桌面/锁屏/最小化） > 手动覆盖（应用/游戏） > 游戏（规则引擎） > 网站 > 应用
     category = "应用"
     if class_name in SPECIAL_CLASSES:
         process, exe_path = SPECIAL_CLASSES[class_name], ""
@@ -91,7 +108,11 @@ def get_foreground_info():
     elif minimized:
         process, exe_path = "最小化", ""
         category = "系统"
-    elif "steamapps" in exe_path.lower():
+    elif override_for(process) == "游戏":
+        category = "游戏"
+    elif override_for(process) == "应用":
+        category = "应用"
+    elif is_game(exe_path, process, title):
         category = "游戏"
     elif process.lower() in BROWSER_PROCESSES:
         category = "网站"
@@ -100,7 +121,7 @@ def get_foreground_info():
 
     info = {
         "hwnd": hwnd,
-        "pid": pid.value,
+        "pid": pid,
         "process": process,
         "exe_path": exe_path,
         "title": title,
@@ -119,6 +140,14 @@ def get_foreground_info():
         info["url"] = site.url
 
     return info
+
+
+def get_foreground_info():
+    """返回当前前台窗口信息（含分类与网站）；无窗口时返回 None。"""
+    raw = _collect_window()
+    if raw is None:
+        return None
+    return classify_window(**raw)
 
 
 def _session_key(info: dict) -> tuple:

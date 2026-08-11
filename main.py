@@ -181,6 +181,23 @@ def cmd_unlock(args):
         print("当前没有锁文件，无需解锁。")
 
 
+def cmd_game(args):
+    """游戏识别规则诊断：查看生效规则 / 按规则判断某个进程是否为游戏。"""
+    from tracker.games import GAME_RULES_FILENAME, is_game, load_rules
+
+    if args.action == "rules":
+        rules = load_rules()
+        print("当前生效的游戏识别规则（内置默认 + game_rules.json 覆盖）：")
+        for key, values in rules.items():
+            text = "、".join(values) if values else "（空）"
+            print(f"  {key}: {text}")
+        rules_path = project_root() / GAME_RULES_FILENAME
+        print(f"\n规则文件：{rules_path}（存在：{rules_path.exists()}）")
+    elif args.action == "check":
+        result = is_game(args.path, args.process, args.title)
+        print("是游戏" if result else "不是游戏")
+
+
 def cmd_demo(args):
     from tracker.demo import seed_demo_data
 
@@ -202,6 +219,13 @@ def main():
     p_report.add_argument("--days", type=int, default=1, help="统计天数，1=今日，7=近7天（默认 1）")
     sub.add_parser("now", help="查看当前前台窗口信息（诊断用）")
     sub.add_parser("demo", help="生成 7 天示例数据，便于预览图表")
+    p_game = sub.add_parser("game", help="游戏识别规则诊断")
+    g_sub = p_game.add_subparsers(dest="action", required=True)
+    g_sub.add_parser("rules", help="打印当前生效的游戏识别规则")
+    p_g_check = g_sub.add_parser("check", help="按规则判断某个进程/路径是否为游戏")
+    p_g_check.add_argument("--process", default="", help="进程名，如 VALORANT.exe")
+    p_g_check.add_argument("--path", default="", help="exe 完整路径，如 C:\\Riot Games\\VALORANT\\live\\VALORANT.exe")
+    p_g_check.add_argument("--title", default="", help="窗口标题（可选）")
 
     args = parser.parse_args()
     handlers = {
@@ -212,6 +236,7 @@ def main():
         "now": cmd_now,
         "demo": cmd_demo,
         "unlock": cmd_unlock,
+        "game": cmd_game,
     }
     handlers[args.command](args)
 

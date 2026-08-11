@@ -87,23 +87,43 @@ def _history_candidates() -> list[Path]:
     found: list[Path] = []
     for base in (local / "Google" / "Chrome" / "User Data",
                  local / "Microsoft" / "Edge" / "User Data"):
-        if not base.exists():
+        try:
+            base_ok = base.exists()
+        except OSError:
+            continue  # 目录被锁/无权限时跳过，避免采集线程崩溃
+        if not base_ok:
             continue
         profiles = [base / "Default"]
-        profiles += sorted(base.glob("Profile*"), key=lambda p: p.stat().st_mtime, reverse=True)
+        try:
+            extra = sorted(base.glob("Profile*"), key=lambda p: p.stat().st_mtime, reverse=True)
+        except OSError:
+            extra = []
+        profiles += extra
         for profile in profiles:
             h = profile / "History"
-            if h.exists() and h not in found:
+            try:
+                ok = h.exists()
+            except OSError:
+                ok = False
+            if ok and h not in found:
                 found.append(h)
     return found
 
 
 def _firefox_places() -> list[Path]:
     base = Path(os.environ.get("APPDATA", "")) / "Mozilla" / "Firefox" / "Profiles"
-    if not base.exists():
+    try:
+        profiles = sorted(base.glob("*"), key=lambda p: p.stat().st_mtime, reverse=True)
+    except OSError:
         return []
-    profiles = sorted(base.glob("*"), key=lambda p: p.stat().st_mtime, reverse=True)
-    return [p / "places.sqlite" for p in profiles if (p / "places.sqlite").exists()]
+    result = []
+    for p in profiles:
+        try:
+            if (p / "places.sqlite").exists():
+                result.append(p / "places.sqlite")
+        except OSError:
+            continue
+    return result
 
 
 def _match_rows(rows, window_title: str) -> SiteInfo | None:

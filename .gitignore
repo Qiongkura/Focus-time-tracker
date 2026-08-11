@@ -3,3 +3,7 @@ reports/
 __pycache__/
 .venv/
 .idea/
+build/
+dist/
+*.spec
+category_overrides.json
