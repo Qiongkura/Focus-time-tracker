@@ -138,6 +138,8 @@ class ScreenTimeApp:
         self._rows_sig = {}
         self._card_rows = {}
         self._card_heights = {}
+        self._card_widths = {}  # 最近一次成功布局的卡片宽度缓存（窗口未布局时兜底）
+        self._last_refresh_date = None  # 跨 0 点检测：上次刷新时的日期
         self._card_total_labels = {}
         self._records_dirty = True
         self._stats_tick = 0
@@ -333,9 +335,15 @@ class ScreenTimeApp:
             btn.pack(side="left", padx=2)
             self.tab_buttons[t] = btn
 
-        tk.Label(inner, text="最为频繁", font=theme.font(12, True),
-                 fg=theme.SUB, bg=theme.BG).pack(anchor="w",
-                                                 padx=theme.scale(30), pady=(theme.scale(16), 8))
+        # 跨 0 点提示横幅（默认隐藏，日期变化时显示几秒后自动消失）
+        self.day_banner = tk.Label(inner, text="", font=theme.font(9), fg=theme.ACCENT,
+                                   bg=theme.ACCENT_LIGHTER, anchor="w", justify="left",
+                                   padx=theme.scale(10), pady=4)
+        self._banner_timer = None
+
+        self.freq_title = tk.Label(inner, text="最为频繁", font=theme.font(12, True),
+                                   fg=theme.SUB, bg=theme.BG)
+        self.freq_title.pack(anchor="w", padx=theme.scale(30), pady=(theme.scale(16), 8))
 
         cards = tk.Frame(inner, bg=theme.BG)
         cards.pack(fill="x", padx=theme.scale(28))
@@ -454,13 +462,28 @@ class ScreenTimeApp:
 
     def _sync_card(self, card, card_key, items, total, fill, bar_color,
                    show_pct=False, full_name=False, actions=False):
-        width = max(theme.scale(280), card.winfo_width() - theme.scale(32))
+        # 窗口未布局/最小化时 winfo_width 可能返回 1，用缓存宽度兜底，避免
+        # 以 1px 宽度重建行导致布局异常；布局成功后更新缓存
+        w = card.winfo_width()
+        if w > 10:
+            self._card_widths[card_key] = w
+        else:
+            w = self._card_widths.get(card_key, theme.scale(640))
+        width = max(theme.scale(280), w - theme.scale(32))
         sig = (width, [it["name"] for it in items])
         if self._rows_sig.get(card_key) != sig:
-            self._rows_sig[card_key] = sig
-            card.delete("rowwin")
-            self._build_card_rows(card, card_key, items, fill, bar_color, width,
-                                  show_pct, full_name, actions)
+            # 重建必须“原子化”：只有重建成功才更新 sig；若中途异常（比如
+            # 图标/控件创建失败），清空行引用并抛出，由上层记录日志。
+            # 这样下次刷新 sig 仍旧，会自动重试，不会出现“头部有数据、
+            # 行列表永久消失”的状态。
+            try:
+                card.delete("rowwin")
+                self._build_card_rows(card, card_key, items, fill, bar_color,
+                                      width, show_pct, full_name, actions)
+                self._rows_sig[card_key] = sig
+            except Exception:
+                self._card_rows[card_key] = []
+                raise
             # 重建后立即填充时长/进度，不用等下一个刷新周期
             self._update_card_rows(card_key, items, total, show_pct, full_name)
         else:
@@ -470,71 +493,91 @@ class ScreenTimeApp:
                          show_pct=False, full_name=False, actions=False):
         rows = []
         if not items:
-            items = [{"icon": None, "name": "暂无数据", "seconds": 0, "category": ""}]
+            items = [{"icon": None, "name": "今日暂无记录", "seconds": 0, "category": ""}]
         y = theme.scale(54)
         # 名称可用宽度：预留图标列与右侧时长列后，超长名称自动换行显示完整
         name_area = max(theme.scale(120), width - theme.scale(150))
         for it in items:
-            row = tk.Frame(card, bg=fill)
-            icon_lbl = tk.Label(row, image=it["icon"] if it["icon"] else get_default_icon(40),
-                                bg=fill)
-            name_lbl = tk.Label(row, text=it["name"], font=theme.font(10, True),
-                                fg=theme.TEXT, bg=fill, anchor="w",
-                                justify="left", wraplength=name_area)
-            bar = ProgressBar(row, width=max(theme.scale(60), width - theme.scale(220)),
-                              height=8, fill=bar_color)
-            time_lbl = tk.Label(row, text="", font=theme.font(9), fg=theme.SUB,
-                                bg=fill, anchor="e")
-            actions_frame = None
-            extra_h = 0
-            if actions and it.get("process") and it.get("category") in ("应用", "游戏"):
-                proc = it["process"]
-                target = "游戏" if it["category"] == "应用" else "应用"
-                actions_frame = tk.Frame(row, bg=fill)
-                RoundedButton(
-                    actions_frame, text=f"移到{target}",
-                    command=self._make_mover(proc, target), width=64, height=22,
-                    radius=5, fill=theme.ACCENT_LIGHTER, fg=theme.ACCENT,
-                    bg=fill, font=theme.font(8, True),
-                ).pack(side="left", padx=(0, theme.scale(6)))
-                if override_for(proc):
+            # 单行防御：某一行构建失败（如控件/图标异常）只跳过该行，
+            # 不拖垮整张卡片，保证其他行正常显示
+            try:
+                row = tk.Frame(card, bg=fill)
+                icon_lbl = tk.Label(row, image=it["icon"] if it["icon"] else get_default_icon(40),
+                                    bg=fill)
+                name_lbl = tk.Label(row, text=it["name"], font=theme.font(10, True),
+                                    fg=theme.TEXT, bg=fill, anchor="w",
+                                    justify="left", wraplength=name_area)
+                bar = ProgressBar(row, width=max(theme.scale(60), width - theme.scale(220)),
+                                  height=8, fill=bar_color)
+                time_lbl = tk.Label(row, text="", font=theme.font(9), fg=theme.SUB,
+                                    bg=fill, anchor="e")
+                actions_frame = None
+                extra_h = 0
+                if actions and it.get("process") and it.get("category") in ("应用", "游戏"):
+                    proc = it["process"]
+                    target = "游戏" if it["category"] == "应用" else "应用"
+                    actions_frame = tk.Frame(row, bg=fill)
                     RoundedButton(
-                        actions_frame, text="还原自动",
-                        command=self._make_mover(proc, None), width=64, height=22,
-                        radius=5, fill=theme.SECONDARY_BG, fg=theme.SUB,
+                        actions_frame, text=f"移到{target}",
+                        command=self._make_mover(proc, target), width=64, height=22,
+                        radius=5, fill=theme.ACCENT_LIGHTER, fg=theme.ACCENT,
                         bg=fill, font=theme.font(8, True),
-                    ).pack(side="left")
-                extra_h = theme.scale(26)
-            # 名称换行到多行时行高自动加高，保证名称、时间条、百分比完整显示
-            # 余量需覆盖：名称上方留白 + 第二行时间条/时长标签高度
-            row_h = max(theme.scale(58), name_lbl.winfo_reqheight() + theme.scale(36)) + extra_h
-            row.configure(height=row_h)
-            row.grid_propagate(False)
-            # 两行布局：名称与时间条同列（左对齐），时间条列弹性伸缩
-            icon_lbl.grid(row=0, column=0, rowspan=3 if actions_frame else 2,
-                          padx=(theme.scale(16), theme.scale(10)), pady=theme.scale(6))
-            name_lbl.grid(row=0, column=1, columnspan=2, sticky="w",
-                          padx=(0, theme.scale(16)), pady=(theme.scale(8), 0))
-            bar.grid(row=1, column=1, sticky="ew", pady=(0, theme.scale(6)))
-            time_lbl.grid(row=1, column=2, sticky="e",
-                          padx=(theme.scale(8), theme.scale(16)), pady=(0, theme.scale(6)))
-            if actions_frame:
-                actions_frame.grid(row=2, column=1, columnspan=2, sticky="e",
-                                   padx=(0, theme.scale(16)), pady=(2, theme.scale(4)))
-            row.grid_columnconfigure(1, weight=1)  # 时间条列吸收窗口缩放
-            card.create_window(theme.scale(16), y, window=row, anchor="nw",
-                               width=width, tags="rowwin")
-            rows.append({"icon": icon_lbl, "name": name_lbl, "bar": bar, "time": time_lbl,
-                         "actions": actions_frame})
-            y += row_h + theme.scale(6)
+                    ).pack(side="left", padx=(0, theme.scale(6)))
+                    if override_for(proc):
+                        RoundedButton(
+                            actions_frame, text="还原自动",
+                            command=self._make_mover(proc, None), width=64, height=22,
+                            radius=5, fill=theme.SECONDARY_BG, fg=theme.SUB,
+                            bg=fill, font=theme.font(8, True),
+                        ).pack(side="left")
+                    extra_h = theme.scale(26)
+                # 名称换行到多行时行高自动加高，保证名称、时间条、百分比完整显示
+                # 余量需覆盖：名称上方留白 + 第二行时间条/时长标签高度
+                row_h = max(theme.scale(58), name_lbl.winfo_reqheight() + theme.scale(36)) + extra_h
+                row.configure(height=row_h)
+                row.grid_propagate(False)
+                # 两行布局：名称与时间条同列（左对齐），时间条列弹性伸缩
+                icon_lbl.grid(row=0, column=0, rowspan=3 if actions_frame else 2,
+                              padx=(theme.scale(16), theme.scale(10)), pady=theme.scale(6))
+                name_lbl.grid(row=0, column=1, columnspan=2, sticky="w",
+                              padx=(0, theme.scale(16)), pady=(theme.scale(8), 0))
+                bar.grid(row=1, column=1, sticky="ew", pady=(0, theme.scale(6)))
+                time_lbl.grid(row=1, column=2, sticky="e",
+                              padx=(theme.scale(8), theme.scale(16)), pady=(0, theme.scale(6)))
+                if actions_frame:
+                    actions_frame.grid(row=2, column=1, columnspan=2, sticky="e",
+                                       padx=(0, theme.scale(16)), pady=(2, theme.scale(4)))
+                row.grid_columnconfigure(1, weight=1)  # 时间条列吸收窗口缩放
+                card.create_window(theme.scale(16), y, window=row, anchor="nw",
+                                   width=width, tags="rowwin")
+                rows.append({"icon": icon_lbl, "name": name_lbl, "bar": bar,
+                             "time": time_lbl, "actions": actions_frame})
+                y += row_h + theme.scale(6)
+            except Exception:
+                continue
         self._card_rows[card_key] = rows
         # 记录卡片内容总高度（头部 + 各行实际高度 + 底部留白），供卡片高度自适应
         self._card_heights[card_key] = y + theme.scale(10)
 
+    def _empty_guide(self, hint_week=False):
+        """今日无记录时的引导行：附昨日总时长，避免跨 0 点后误以为数据丢失。"""
+        try:
+            now = datetime.now()
+            today = now.replace(hour=0, minute=0, second=0, microsecond=0)
+            secs = self.db.total_seconds_between(today - timedelta(days=1), today)
+            if secs > 0:
+                extra = "（可切“本周”查看）" if hint_week else ""
+                return [{"icon": None,
+                         "name": f"今日暂无记录 · 昨日共 {fmt_minsec(secs)}{extra}",
+                         "seconds": 0, "category": ""}]
+        except Exception:  # noqa: BLE001
+            pass
+        return [{"icon": None, "name": "今日暂无记录", "seconds": 0, "category": ""}]
+
     def _update_card_rows(self, card_key, items, total, show_pct=False, full_name=False):
         rows = self._card_rows.get(card_key, [])
         if not items:
-            items = [{"icon": None, "name": "暂无数据", "seconds": 0, "category": ""}]
+            items = [{"icon": None, "name": "今日暂无记录", "seconds": 0, "category": ""}]
         for i, row in enumerate(rows):
             if i >= len(items):
                 break
@@ -561,8 +604,8 @@ class ScreenTimeApp:
         self._card_total_labels["应用"].config(text=f"共 {fmt_minsec(app_total)}")
         self._card_total_labels["网站"].config(text=f"共 {fmt_minsec(site_total)}")
 
-        app_items = [self._process_item(a) for a in apps[:MAX_ROWS]]
-        site_items = [self._site_item(s) for s in sites[:MAX_ROWS]]
+        app_items = [self._process_item(a) for a in apps[:MAX_ROWS]] or self._empty_guide(hint_week=True)
+        site_items = [self._site_item(s) for s in sites[:MAX_ROWS]] or self._empty_guide(hint_week=True)
         self._sync_card(self.app_card, "应用", app_items, app_total, theme.CARD_BG, theme.ACCENT)
         self._sync_card(self.site_card, "网站", site_items, site_total,
                         theme.ACCENT_LIGHTER, theme.ACCENT)
@@ -1167,36 +1210,6 @@ class ScreenTimeApp:
         except Exception:  # noqa: BLE001
             pass
 
-    def _log_layout_diag(self, why: str = "refresh"):
-        """记录窗口/滚动区/卡片真实尺寸到 data/ui_errors.log，便于排查布局问题。"""
-        try:
-            import traceback as _tb
-            log_dir = project_root() / self.cfg.get("data_dir", "data")
-            log_dir.mkdir(parents=True, exist_ok=True)
-            info = (
-                f"[{datetime.now():%Y-%m-%d %H:%M:%S}] layout({why}): "
-                f"root={self.root.winfo_width()}x{self.root.winfo_height()} "
-                f"scale={theme.scale(1.0):.2f} "
-            )
-            try:
-                sc = self.cat_cards["应用"]["card"].master.master.master
-                info += f"cat_grid={self.cat_grid.winfo_width()} "
-            except Exception:
-                pass
-            try:
-                card = self.cat_cards["应用"]["card"]
-                info += f"card_h={card.winfo_height()} "
-                rows = self._card_rows.get("分类-应用", [])
-                info += f"rows={len(rows)} "
-                if rows:
-                    info += f"bar_w={rows[0]['bar'].winfo_width()} "
-            except Exception:
-                pass
-            with open(log_dir / "ui_errors.log", "a", encoding="utf-8") as f:
-                f.write(info + "\n")
-        except Exception:
-            pass
-
     def _refresh_categories(self, start, end):
         cats = self.db.category_summary_between(start, end)
         apps = self.db.desktop_summary_between(start, end)
@@ -1209,12 +1222,14 @@ class ScreenTimeApp:
             widgets["total"].config(text=f"共 {fmt_minsec(secs)} · 占 {pct:.0f}%")
             key = f"分类-{cat}"
             if cat == "网站":
-                items = [self._site_item(s, full_name=True) for s in sites]  # 全部网站
+                items = ([self._site_item(s, full_name=True) for s in sites]
+                         or self._empty_guide())  # 全部网站
                 self._sync_card(widgets["card"], key, items, secs, "#FFFFFF",
                                 theme.CATEGORY_META[cat][1], show_pct=True, full_name=True)
             else:
-                items = [self._process_item(a, full_name=True) for a in apps
-                         if a["category"] == cat]  # 全部进程
+                items = ([self._process_item(a, full_name=True) for a in apps
+                          if a["category"] == cat]
+                         or self._empty_guide())  # 全部进程
                 # 与首页完全相同的行渲染管线，保证显示效果一致；进程行附带移动按钮
                 self._sync_card(widgets["card"], key, items, secs, "#FFFFFF",
                                 theme.CATEGORY_META[cat][1], show_pct=True, full_name=True,
@@ -1569,11 +1584,26 @@ class ScreenTimeApp:
         if self.current_page == "stats":
             self._stats_redraw_timer = self.root.after(60, self._draw_stats)
 
+    def _show_day_banner(self):
+        """跨 0 点后显示提示横幅：新的一天已开始，数据已切换到今日。"""
+        try:
+            b = self.day_banner
+            b.config(text="🌅 新的一天已开始 · 页面已切换到今日数据（昨日数据可切“本周”查看）")
+            b.pack(fill="x", padx=theme.scale(28), pady=(theme.scale(8), 0),
+                   before=self.freq_title)
+            if self._banner_timer:
+                self.root.after_cancel(self._banner_timer)
+            self._banner_timer = self.root.after(8000, self._hide_day_banner)
+        except Exception:  # noqa: BLE001
+            pass
+
+    def _hide_day_banner(self):
+        try:
+            self.day_banner.pack_forget()
+        except Exception:  # noqa: BLE001
+            pass
+
     def refresh(self):
-        # 布局诊断：每 20 次刷新记录一次真实尺寸
-        self._diag_count = getattr(self, "_diag_count", 0) + 1
-        if self._diag_count % 20 == 0:
-            self._log_layout_diag()
         # 下拉框点开不选被清空时，自动恢复当前值
         try:
             if not self.filter_combo.get():
@@ -1583,6 +1613,17 @@ class ScreenTimeApp:
 
         now = datetime.now()
         start = self._period_start()
+
+        # 跨 0 点检测：日期变化后强制重建所有卡片，避免旧一天的行/签名残留
+        today = now.date()
+        if self._last_refresh_date is not None and self._last_refresh_date != today:
+            self._rows_sig.clear()
+            self._card_widths.clear()
+            self._records_sig = None
+            self._records_dirty = True
+            self._stats_fixed_size = None
+            self._show_day_banner()
+        self._last_refresh_date = today
 
         # 各模块独立刷新，互不拖累（首页出错不影响分类 TOP3）
         try:
