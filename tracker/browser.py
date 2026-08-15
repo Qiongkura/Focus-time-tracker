@@ -11,6 +11,7 @@ import re
 import shutil
 import sqlite3
 import tempfile
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import urlparse
@@ -24,6 +25,20 @@ _CHROME_EPOCH = datetime(1601, 1, 1, tzinfo=timezone.utc)
 _UNIX_EPOCH = datetime(1970, 1, 1, tzinfo=timezone.utc)
 
 _cache: dict[tuple, "SiteInfo"] = {}
+
+# 历史库查询节流：浏览器运行时 History 常被独占锁，一次查询可能阻塞数百毫秒，
+# 限制同一浏览器进程的查询频率，避免 GUI 刷新线程被反复拖住
+_last_db_query: dict[str, float] = {}
+_DB_QUERY_MIN_INTERVAL = 3.0
+
+
+def _db_query_due(proc: str) -> bool:
+    now = time.monotonic()
+    last = _last_db_query.get(proc, 0.0)
+    if now - last >= _DB_QUERY_MIN_INTERVAL:
+        _last_db_query[proc] = now
+        return True
+    return False
 
 
 class SiteInfo:
@@ -69,7 +84,10 @@ def _copy_readable(src: Path) -> str:
 def _open_ro(path: Path):
     """优先直接只读打开数据库，避免复制大文件；失败返回 None。"""
     try:
-        return sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+        # timeout=0.2：浏览器运行时会独占锁住 History 文件，sqlite 默认
+        # busy 超时 5 秒会让 GUI 主线程每 2 秒卡死一次（界面“冻结”），
+        # 这里用短超时快速放弃，走标题兜底
+        return sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=0.2)
     except Exception:
         return None
 
@@ -153,7 +171,7 @@ def _resolve_chromium(window_title: str) -> SiteInfo | None:
             tmp = _copy_readable(history)
             if not tmp:
                 continue
-            conn = sqlite3.connect(f"file:{tmp}?mode=ro", uri=True)
+            conn = sqlite3.connect(f"file:{tmp}?mode=ro", uri=True, timeout=0.2)
         try:
             rows = conn.execute(
                 "SELECT u.url, u.title, v.visit_time FROM urls u "
@@ -188,7 +206,7 @@ def _resolve_firefox(window_title: str) -> SiteInfo | None:
             tmp = _copy_readable(places)
             if not tmp:
                 continue
-            conn = sqlite3.connect(f"file:{tmp}?mode=ro", uri=True)
+            conn = sqlite3.connect(f"file:{tmp}?mode=ro", uri=True, timeout=0.2)
         try:
             rows = conn.execute(
                 "SELECT p.url, p.title, h.visit_date FROM moz_places p "
@@ -223,9 +241,9 @@ def resolve_site(process_name: str, window_title: str) -> SiteInfo:
 
     if not window_title or not window_title.strip():
         result = SiteInfo()
-    elif proc in CHROME_EDGE:
+    elif proc in CHROME_EDGE and _db_query_due(proc):
         result = _resolve_chromium(window_title)
-    elif proc in FIREFOX:
+    elif proc in FIREFOX and _db_query_due(proc):
         result = _resolve_firefox(window_title)
     else:
         result = None

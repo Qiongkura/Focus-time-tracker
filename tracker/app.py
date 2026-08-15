@@ -1533,7 +1533,12 @@ class ScreenTimeApp:
     def _refresh_loop(self):
         if not self.root.winfo_exists():
             return
-        self.refresh()
+        # 防御：refresh 内部任何未预期异常都不能中断 after 链，
+        # 否则界面会永久冻结（只显示最后一次成功刷新的内容）
+        try:
+            self.refresh()
+        except Exception as exc:  # noqa: BLE001
+            self._log_error("refresh_loop", exc)
         self.root.after(2000, self._refresh_loop)
 
     def _warm_stats(self):
