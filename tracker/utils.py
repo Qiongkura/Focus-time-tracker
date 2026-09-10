@@ -25,6 +25,8 @@ def clean_site_text(text: str) -> str:
     t = _BROWSER_SUFFIX_RE.sub("", t)
     t = _PERSONAL_SUFFIX_RE.sub("", t)
     t = re.sub(r"\s+", " ", t).strip()
+    # 多标签后缀去掉后可能留下悬空的分隔符（如 "页面A -"）
+    t = re.sub(r"\s*[-—|·]\s*$", "", t).strip()
     return t
 
 

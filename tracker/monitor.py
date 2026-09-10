@@ -157,26 +157,38 @@ def _session_key(info: dict) -> tuple:
     return (info["category"], info["process"])
 
 
-def _close_session(db, current, now, min_session):
-    """结束一个会话；时长不足 min_session 则不写入。"""
+def _write_segment(db, current, now: datetime, min_session: float) -> None:
+    """从 current['start'] 写到 now；不足 min_session 则不写。"""
     if current is None:
         return
     duration = (now - current["start"]).total_seconds()
-    if duration >= min_session:
-        db.add_session(
-            current["start"], now, current["process"], current["exe_path"],
-            current["title"], current["category"], current["site"], current["url"],
-        )
+    if duration < min_session:
+        return
+    db.add_session(
+        current["start"], now, current["process"], current["exe_path"],
+        current["title"], current["category"], current["site"], current["url"],
+    )
+
+
+def _close_session(db, current, now, min_session):
+    """结束一个会话；时长不足 min_session 则不写入。"""
+    _write_segment(db, current, now, min_session)
 
 
 def run_tracking(db, cfg: dict, stop_event=None) -> None:
-    """前台窗口采样主循环，Ctrl+C 或 stop_event 优雅退出。"""
+    """前台窗口采样主循环，Ctrl+C 或 stop_event 优雅退出。
+
+    长会话每隔 checkpoint_seconds 落盘一段，进程被强杀时最多丢一段间隔内的时长。
+    """
     interval = float(cfg.get("poll_interval_seconds", 1.0))
     min_session = float(cfg.get("min_session_seconds", 3))
+    # 超过该时长仍未切换窗口就先落库一段，避免崩溃/强杀丢掉整段会话
+    checkpoint_seconds = float(cfg.get("checkpoint_seconds", 45.0))
     exclude = set(cfg.get("exclude_processes", []) or [])
     browser_site = bool(cfg.get("browser_site_tracking", True))
 
     current = None
+    last_checkpoint = None
     print("开始记录前台窗口使用时长（按 Ctrl+C 停止）...")
     try:
         while True:
@@ -195,10 +207,18 @@ def run_tracking(db, cfg: dict, stop_event=None) -> None:
             if info is None or info["process"] in exclude:
                 _close_session(db, current, now, min_session)
                 current = None
+                last_checkpoint = None
             else:
                 key = _session_key(info)
                 if current is not None and current["key"] == key:
-                    pass  # 同一会话继续累计
+                    # 长会话 checkpoint：已写过的段之后重新起算 start
+                    # 强杀/断电最多丢掉 checkpoint_seconds 内的时长
+                    if last_checkpoint is not None and \
+                            (now - last_checkpoint).total_seconds() >= checkpoint_seconds:
+                        _write_segment(db, current, now, checkpoint_seconds * 0.5)
+                        current = dict(current)
+                        current["start"] = now
+                        last_checkpoint = now
                 else:
                     _close_session(db, current, now, min_session)
                     current = {
@@ -211,6 +231,7 @@ def run_tracking(db, cfg: dict, stop_event=None) -> None:
                         "url": info.get("url", ""),
                         "start": now,
                     }
+                    last_checkpoint = now
             time.sleep(interval)
     except KeyboardInterrupt:
         print("\n正在保存最后一段会话并退出...")

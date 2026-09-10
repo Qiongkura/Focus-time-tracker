@@ -1,4 +1,4 @@
-﻿# 屏幕使用时间统计工具
+# 屏幕使用时间统计工具
 
 一个用 Python 编写的 Windows 桌面工具：自动检测当前聚焦的前台窗口/进程，记录使用时长，并用浅色风格的界面可视化展示。
 
@@ -72,6 +72,13 @@ python main.py report --days 7      # 生成近 7 天趋势图
 | `python main.py unlock` | 清除残留采集锁（提示“已有采集会话在运行”时使用） |
 | `python main.py demo` | 生成 7 天示例数据，便于预览 |
 
+### 跑测试
+
+```bash
+python -m pip install pytest
+python -m pytest tests -q
+```
+
 ## GUI 页面说明
 
 - **首页（概览）**：右上角「今日 / 本周」切换；「最为频繁」区应用 / 网站两张卡片（宽屏并排、窄窗自动竖排），每行 = 图标 + 名称 + 进度条 + 时长；下方分类下拉框与 4 张统计卡
@@ -86,6 +93,7 @@ python main.py report --days 7      # 生成近 7 天趋势图
 {
   "poll_interval_seconds": 1.0,
   "min_session_seconds": 3,
+  "checkpoint_seconds": 45,
   "exclude_processes": ["python.exe"],
   "browser_site_tracking": true,
   "data_dir": "data",
@@ -95,6 +103,7 @@ python main.py report --days 7      # 生成近 7 天趋势图
 
 - `poll_interval_seconds`：采样间隔（秒），调小更精确、调大更省资源
 - `min_session_seconds`：短于该时长的窗口切换不记录，避免碎片数据
+- `checkpoint_seconds`：长会话每隔该秒数落盘一段，进程被强杀/断电时最多丢这一段
 - `exclude_processes`：不想统计的进程名，如 `["explorer.exe"]`；处于这些进程时不累计任何应用时长
 - `browser_site_tracking`：是否识别浏览器正在访问的具体网站；关闭后浏览器按普通应用统计
 - `data_dir` / `report_dir`：数据与报告目录（相对项目根目录，也可写绝对路径）

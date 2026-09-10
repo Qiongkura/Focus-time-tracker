@@ -596,9 +596,20 @@ class ScreenTimeApp:
             else:
                 row["time"].config(text="")
 
-    def _refresh_home(self, start, end):
-        apps = self.db.desktop_summary_between(start, end)
-        sites = self.db.sites_summary_between(start, end)
+    def _period_snapshot(self, start, end):
+        """同一时间窗内只查一次库，供首页/小卡片/分类页共用。"""
+        return {
+            "start": start,
+            "end": end,
+            "apps": self.db.desktop_summary_between(start, end),
+            "sites": self.db.sites_summary_between(start, end),
+            "cats": self.db.category_summary_between(start, end),
+        }
+
+    def _refresh_home(self, start, end, snapshot=None):
+        snap = snapshot or self._period_snapshot(start, end)
+        apps = snap["apps"]
+        sites = snap["sites"]
         app_total = sum(a["seconds"] for a in apps)
         site_total = sum(s["seconds"] for s in sites)
         self._card_total_labels["应用"].config(text=f"共 {fmt_minsec(app_total)}")
@@ -609,12 +620,13 @@ class ScreenTimeApp:
         self._sync_card(self.app_card, "应用", app_items, app_total, theme.CARD_BG, theme.ACCENT)
         self._sync_card(self.site_card, "网站", site_items, site_total,
                         theme.ACCENT_LIGHTER, theme.ACCENT)
-        self._update_mini_cards(start, end)
+        self._update_mini_cards(start, end, snapshot=snap)
 
-    def _update_mini_cards(self, start, end):
-        cats = self.db.category_summary_between(start, end)
-        apps = self.db.desktop_summary_between(start, end)
-        sites = self.db.sites_summary_between(start, end)
+    def _update_mini_cards(self, start, end, snapshot=None):
+        snap = snapshot or self._period_snapshot(start, end)
+        cats = snap["cats"]
+        apps = snap["apps"]
+        sites = snap["sites"]
         total_all = sum(c["seconds"] for c in cats.values())
         total_app = cats.get("应用", {}).get("seconds", 0)
         total_game = cats.get("游戏", {}).get("seconds", 0)
@@ -1210,10 +1222,11 @@ class ScreenTimeApp:
         except Exception:  # noqa: BLE001
             pass
 
-    def _refresh_categories(self, start, end):
-        cats = self.db.category_summary_between(start, end)
-        apps = self.db.desktop_summary_between(start, end)
-        sites = self.db.sites_summary_between(start, end)
+    def _refresh_categories(self, start, end, snapshot=None):
+        snap = snapshot or self._period_snapshot(start, end)
+        cats = snap["cats"]
+        apps = snap["apps"]
+        sites = snap["sites"]
         total_all = sum(c["seconds"] for c in cats.values()) or 1
         for cat, widgets in self.cat_cards.items():
             secs = cats.get(cat, {}).get("seconds", 0)
@@ -1630,13 +1643,19 @@ class ScreenTimeApp:
             self._show_day_banner()
         self._last_refresh_date = today
 
-        # 各模块独立刷新，互不拖累（首页出错不影响分类 TOP3）
+        # 各模块独立刷新，互不拖累（首页出错不影响分类 TOP3）；
+        # 同一时间窗只查一次库，snapshot 复用 apps/sites/cats
         try:
-            self._refresh_home(start, now)
+            snap = self._period_snapshot(start, now)
+        except Exception as exc:  # noqa: BLE001
+            self._log_error("snapshot", exc)
+            snap = None
+        try:
+            self._refresh_home(start, now, snapshot=snap)
         except Exception as exc:  # noqa: BLE001
             self._log_error("home", exc)
         try:
-            self._refresh_categories(start, now)
+            self._refresh_categories(start, now, snapshot=snap)
         except Exception as exc:  # noqa: BLE001
             self._log_error("categories", exc)
         try:

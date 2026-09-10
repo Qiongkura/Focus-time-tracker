@@ -25,6 +25,7 @@ _CHROME_EPOCH = datetime(1601, 1, 1, tzinfo=timezone.utc)
 _UNIX_EPOCH = datetime(1970, 1, 1, tzinfo=timezone.utc)
 
 _cache: dict[tuple, "SiteInfo"] = {}
+_CACHE_MAX = 512
 
 # 历史库查询节流：浏览器运行时 History 常被独占锁，一次查询可能阻塞数百毫秒，
 # 限制同一浏览器进程的查询频率，避免 GUI 刷新线程被反复拖住
@@ -39,6 +40,14 @@ def _db_query_due(proc: str) -> bool:
         _last_db_query[proc] = now
         return True
     return False
+
+
+def _cache_put(key: tuple, value: "SiteInfo") -> "SiteInfo":
+    if len(_cache) >= _CACHE_MAX and key not in _cache:
+        # 简单 FIFO 上限：先入先出丢弃，避免长会话无限涨内存
+        _cache.pop(next(iter(_cache)), None)
+    _cache[key] = value
+    return value
 
 
 class SiteInfo:
@@ -235,22 +244,30 @@ def _resolve_firefox(window_title: str) -> SiteInfo | None:
 def resolve_site(process_name: str, window_title: str) -> SiteInfo:
     """根据浏览器进程名 + 窗口标题解析当前网站；匹配不到时用标题兜底。"""
     proc = (process_name or "").lower()
-    key = (proc, window_title or "")
+    title = window_title or ""
+    key = (proc, title)
     if key in _cache:
         return _cache[key]
+    if not title.strip():
+        return _cache_put(key, SiteInfo())
 
-    if not window_title or not window_title.strip():
-        result = SiteInfo()
-    elif proc in CHROME_EDGE and _db_query_due(proc):
-        result = _resolve_chromium(window_title)
-    elif proc in FIREFOX and _db_query_due(proc):
-        result = _resolve_firefox(window_title)
-    else:
-        result = None
+    is_browser = proc in CHROME_EDGE or proc in FIREFOX
+    if not is_browser:
+        return _cache_put(key, _title_fallback(title))
 
-    if not result:
-        # 匹配不到（例如隐私模式、历史被清空）：退化为用窗口标题当站点
-        fallback = _normalize(window_title)[:40] or "网页"
-        result = SiteInfo(site=fallback, title=window_title, url="")
-    _cache[key] = result
-    return result
+    # 节流到期：真正查历史库；未到期只做临时标题兜底，不落永久缓存，
+    # 下次同一标题到达时再尝试查库
+    if not _db_query_due(proc):
+        return _title_fallback(title)
+
+    result = _resolve_chromium(title) if proc in CHROME_EDGE else _resolve_firefox(title)
+    if result:
+        return _cache_put(key, result)
+    # 查过库仍匹配不到（隐私模式、历史被清空等）：标题兜底并缓存
+    return _cache_put(key, _title_fallback(title))
+
+
+def _title_fallback(title: str) -> SiteInfo:
+    """匹配不到域名时退化为用窗口标题当站点（仅展示，不保证可合并）。"""
+    site = _normalize(title)[:40] or "网页"
+    return SiteInfo(site=site, title=title, url="")
