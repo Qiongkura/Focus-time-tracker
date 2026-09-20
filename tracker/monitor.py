@@ -1,4 +1,15 @@
-"""Windows 前台窗口采集（仅依赖标准库 ctypes）。"""
+"""Windows 前台窗口采集（仅依赖标准库 ctypes）。
+
+内部按职责拆成几个可单独测试的组件：
+
+* :class:`WindowSampler`      —— 取前台窗口信息（采集函数可注入，便于测试）
+* :class:`SessionAccumulator` —— 维护「当前会话」，处理切段与 checkpoint
+* :class:`SessionWriter`      —— 把会话段写进数据库
+* :class:`TrackingService`    —— 编排上面几者的主循环
+
+模块级仍保留 ``get_foreground_info`` / ``classify_window`` / ``run_tracking``
+等原有函数，行为不变，外部调用方（main.py、app.py、测试）无需改动。
+"""
 from __future__ import annotations
 
 import ctypes
@@ -143,14 +154,6 @@ def classify_window(process: str = "", exe_path: str = "", title: str = "",
     return info
 
 
-def get_foreground_info():
-    """返回当前前台窗口信息（含分类与网站）；无窗口时返回 None。"""
-    raw = _collect_window()
-    if raw is None:
-        return None
-    return classify_window(**raw)
-
-
 def _session_key(info: dict) -> tuple:
     """会话身份：网站按站点切换，其余按 分类+进程 切换。"""
     if info["category"] == "网站":
@@ -158,17 +161,206 @@ def _session_key(info: dict) -> tuple:
     return (info["category"], info["process"])
 
 
+# ---------- 组件 ----------
+
+class WindowSampler:
+    """取前台窗口信息。
+
+    ``collect`` 可注入，方便测试替换掉真实的 Win32 调用。
+    """
+
+    def __init__(self, collect=None):
+        self._collect = collect or _collect_window
+
+    def sample(self) -> dict | None:
+        """返回原始窗口数据；无前台窗口时返回 None。"""
+        return self._collect()
+
+    def info(self) -> dict | None:
+        """返回已分类的窗口信息；无前台窗口时返回 None。"""
+        raw = self.sample()
+        if raw is None:
+            return None
+        return classify_window(**raw)
+
+
+_default_sampler = WindowSampler()
+
+
+class SessionWriter:
+    """把会话段写进数据库；时长不足 ``min_session`` 的段直接丢弃。"""
+
+    def __init__(self, db, min_session: float = 3.0):
+        self.db = db
+        self.min_session = max(0.0, float(min_session))
+
+    def write(self, session: dict | None, end: datetime) -> bool:
+        """写一段会话；返回是否真的落库。"""
+        if session is None:
+            return False
+        duration = (end - session["start"]).total_seconds()
+        if duration < self.min_session:
+            return False
+        self.db.add_session(
+            session["start"], end, session["process"], session["exe_path"],
+            session["title"], session["category"], session["site"], session["url"],
+        )
+        return True
+
+
+class SessionAccumulator:
+    """维护「当前会话」，决定切段与长会话 checkpoint。
+
+    它不直接写库，只交出「该写哪一段、写到什么时刻」，落库交给
+    :class:`SessionWriter`——这样切段逻辑可以脱离数据库单独测试。
+    """
+
+    def __init__(self, min_session: float = 3.0, checkpoint_seconds: float = 45.0):
+        self.min_session = max(0.0, float(min_session))
+        self.checkpoint_seconds = float(checkpoint_seconds)
+        self.current: dict | None = None
+        self.last_checkpoint: datetime | None = None
+
+    def observe(self, info: dict | None, now: datetime) -> list[tuple[dict, datetime]]:
+        """喂入一次采样，返回本次需要落库的 ``(session, end_time)`` 列表。"""
+        pending: list[tuple[dict, datetime]] = []
+
+        if info is None:
+            segment = self._close(now)
+            if segment:
+                pending.append(segment)
+            return pending
+
+        key = _session_key(info)
+        if self.current is not None and self.current["key"] == key:
+            # 长会话 checkpoint：先落已写过的段，再从 now 重新起算 start，
+            # 进程被强杀时最多丢 checkpoint_seconds 内的时长
+            if (self.last_checkpoint is not None
+                    and (now - self.last_checkpoint).total_seconds() >= self.checkpoint_seconds):
+                segment = self._segment(self.current, now, self.checkpoint_seconds * 0.5)
+                if segment:
+                    pending.append(segment)
+                self.current = dict(self.current)
+                self.current["start"] = now
+                self.last_checkpoint = now
+            return pending
+
+        segment = self._close(now)
+        if segment:
+            pending.append(segment)
+        self.current = {
+            "key": key,
+            "process": info["process"],
+            "exe_path": info["exe_path"],
+            "title": info.get("site_title") or info["title"],
+            "category": info["category"],
+            "site": info.get("site", ""),
+            "url": info.get("url", ""),
+            "start": now,
+        }
+        self.last_checkpoint = now
+        return pending
+
+    def flush(self, now: datetime) -> tuple[dict, datetime] | None:
+        """退出时交出最后一段（没有进行中的会话则返回 None）。"""
+        return self._close(now)
+
+    def _close(self, now: datetime) -> tuple[dict, datetime] | None:
+        if self.current is None:
+            return None
+        segment = (self.current, now)
+        self.current = None
+        self.last_checkpoint = None
+        return segment
+
+    @staticmethod
+    def _segment(session: dict, end: datetime,
+                 min_duration: float) -> tuple[dict, datetime] | None:
+        if (end - session["start"]).total_seconds() < min_duration:
+            return None
+        return (session, end)
+
+
+class TrackingService:
+    """编排「采样 → 分类 → 累积 → 落库」的主循环。"""
+
+    def __init__(self, db, cfg: dict, stop_event=None, fetch_info=None):
+        # 下限保护：本类也可能被直接构造，此时 cfg 未必经过 config.normalize_config
+        self.interval = max(
+            MIN_POLL_INTERVAL, float(cfg.get("poll_interval_seconds", 1.0) or 1.0))
+        min_session = max(0.0, float(cfg.get("min_session_seconds", 3) or 0))
+        self.stop_event = stop_event
+        # fetch_info 可注入；默认走模块级 get_foreground_info，测试常替换它
+        self.fetch_info = fetch_info or get_foreground_info
+        self.browser_site_tracking = bool(cfg.get("browser_site_tracking", True))
+        self.accumulator = SessionAccumulator(
+            min_session=min_session,
+            checkpoint_seconds=float(cfg.get("checkpoint_seconds", 45.0) or 45.0),
+        )
+        self.writer = SessionWriter(db, min_session=min_session)
+        # 进程名统一小写比较：Windows 返回 chrome.exe，而用户习惯按 Chrome.exe 配置
+        self.exclude = {str(name).strip().lower()
+                        for name in (cfg.get("exclude_processes") or [])}
+
+    def run(self) -> None:
+        """主循环；Ctrl+C 或 stop_event 触发时优雅退出。"""
+        print("开始记录前台窗口使用时长（按 Ctrl+C 停止）...")
+        try:
+            while not self._stopped():
+                self.tick()
+                if self._wait():
+                    break
+        except KeyboardInterrupt:
+            print("\n正在保存最后一段会话并退出...")
+        finally:
+            self._flush()
+
+    def tick(self) -> None:
+        """采样一次，并落库本次需要结束的会话段。"""
+        info = self.fetch_info()
+
+        if info is not None and not self.browser_site_tracking and info["category"] == "网站":
+            # 关闭网站细分后，浏览器按普通应用统计
+            info = dict(info)
+            info["category"] = "应用"
+            info["site"] = ""
+            info["site_title"] = ""
+            info["url"] = ""
+
+        if info is not None and (info["process"] or "").strip().lower() in self.exclude:
+            info = None
+
+        now = datetime.now()
+        for session, end in self.accumulator.observe(info, now):
+            self.writer.write(session, end)
+
+    def _stopped(self) -> bool:
+        return self.stop_event is not None and self.stop_event.is_set()
+
+    def _wait(self) -> bool:
+        """等待一个采样间隔；返回 True 表示收到停止信号。"""
+        if self.stop_event is not None:
+            # 用 wait 代替 sleep：收到停止信号时立即返回，不必等满一个间隔
+            return bool(self.stop_event.wait(self.interval))
+        time.sleep(self.interval)
+        return False
+
+    def _flush(self) -> None:
+        segment = self.accumulator.flush(datetime.now())
+        if segment:
+            self.writer.write(*segment)
+
+
+# ---------- 兼容层（保持原有模块级接口） ----------
+
+def get_foreground_info():
+    """返回当前前台窗口信息（含分类与网站）；无窗口时返回 None。"""
+    return _default_sampler.info()
+
+
 def _write_segment(db, current, now: datetime, min_session: float) -> None:
     """从 current['start'] 写到 now；不足 min_session 则不写。"""
-    if current is None:
-        return
-    duration = (now - current["start"]).total_seconds()
-    if duration < min_session:
-        return
-    db.add_session(
-        current["start"], now, current["process"], current["exe_path"],
-        current["title"], current["category"], current["site"], current["url"],
-    )
+    SessionWriter(db, min_session=min_session).write(current, now)
 
 
 def _close_session(db, current, now, min_session):
@@ -181,68 +373,4 @@ def run_tracking(db, cfg: dict, stop_event=None) -> None:
 
     长会话每隔 checkpoint_seconds 落盘一段，进程被强杀时最多丢一段间隔内的时长。
     """
-    # 下限保护：本函数也可能被直接调用，此时 cfg 未必经过 config.normalize_config
-    interval = max(MIN_POLL_INTERVAL, float(cfg.get("poll_interval_seconds", 1.0) or 1.0))
-    min_session = max(0.0, float(cfg.get("min_session_seconds", 3) or 0))
-    # 超过该时长仍未切换窗口就先落库一段，避免崩溃/强杀丢掉整段会话
-    checkpoint_seconds = float(cfg.get("checkpoint_seconds", 45.0) or 45.0)
-    # 进程名统一小写比较：Windows 返回 chrome.exe，而用户习惯按 Chrome.exe 配置
-    exclude = {str(name).strip().lower() for name in (cfg.get("exclude_processes") or [])}
-    browser_site = bool(cfg.get("browser_site_tracking", True))
-
-    current = None
-    last_checkpoint = None
-    print("开始记录前台窗口使用时长（按 Ctrl+C 停止）...")
-    try:
-        while True:
-            if stop_event is not None and stop_event.is_set():
-                break
-            info = get_foreground_info()
-            now = datetime.now()
-
-            if info is not None and not browser_site and info["category"] == "网站":
-                # 关闭网站细分后，浏览器按普通应用统计
-                info = dict(info)
-                info["category"] = "应用"
-                info["site"] = ""
-                info["url"] = ""
-
-            if info is None or (info["process"] or "").strip().lower() in exclude:
-                _close_session(db, current, now, min_session)
-                current = None
-                last_checkpoint = None
-            else:
-                key = _session_key(info)
-                if current is not None and current["key"] == key:
-                    # 长会话 checkpoint：已写过的段之后重新起算 start
-                    # 强杀/断电最多丢掉 checkpoint_seconds 内的时长
-                    if last_checkpoint is not None and \
-                            (now - last_checkpoint).total_seconds() >= checkpoint_seconds:
-                        _write_segment(db, current, now, checkpoint_seconds * 0.5)
-                        current = dict(current)
-                        current["start"] = now
-                        last_checkpoint = now
-                else:
-                    _close_session(db, current, now, min_session)
-                    current = {
-                        "key": key,
-                        "process": info["process"],
-                        "exe_path": info["exe_path"],
-                        "title": info.get("site_title") or info["title"],
-                        "category": info["category"],
-                        "site": info.get("site", ""),
-                        "url": info.get("url", ""),
-                        "start": now,
-                    }
-                    last_checkpoint = now
-            # 用 stop_event.wait 代替 sleep：收到停止信号时立即退出，
-            # 不必再等满一个采样间隔（间隔设成 10 秒时差异很明显）
-            if stop_event is not None:
-                if stop_event.wait(interval):
-                    break
-            else:
-                time.sleep(interval)
-    except KeyboardInterrupt:
-        print("\n正在保存最后一段会话并退出...")
-    finally:
-        _close_session(db, current, datetime.now(), min_session)
+    TrackingService(db, cfg, stop_event).run()
