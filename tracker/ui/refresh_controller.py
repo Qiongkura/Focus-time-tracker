@@ -9,6 +9,14 @@ import tkinter as tk
 from datetime import datetime, timedelta
 
 from .. import theme
+from ..widgets import force_all_content_resize
+
+# 窗口缩放防抖：拖动过程中不做重活，停手后等这么久再跑一次布局收尾
+RESIZE_DEBOUNCE_MS = 90
+# 内容宽度「精确落位」的防抖。重排整块内容区是最贵的一步（首页约 85 个
+# 控件要重绘），所以比布局收尾更晚、且只在真正停手后才做；拖动过程中由
+# ScrollArea 自己的节流负责跟手。
+RESIZE_CONTENT_SETTLE_MS = 280
 
 
 class RefreshMixin:
@@ -55,8 +63,29 @@ class RefreshMixin:
         self._schedule_hourly_stats()
 
     def _on_root_resize(self):
+        # 拖窗口时 <Configure> 每秒能触发几十次，而一次完整 refresh() 要跑
+        # 二十来条 SQL。原实现每次都 after_idle 一个完整 refresh()，事件积压
+        # 起来就表现为「时间条适配慢」。
+        #
+        # 现在拆成两层：
+        #  * 拖动过程中——卡片自己的 <Configure> 触发 _apply_card_widths，
+        #    只改行宽/换行/坐标，不建控件不查库，每帧跟手；
+        #  * 停手之后——防抖跑一次布局收尾（_on_resize_settled），
+        #    处理并排 <-> 竖排翻转，同样不查库。
         try:
-            self.root.after_idle(self.refresh)
+            if getattr(self, "_resize_timer", None):
+                self.root.after_cancel(self._resize_timer)
+            self._resize_timer = self.root.after(RESIZE_DEBOUNCE_MS,
+                                                 self._on_resize_settled)
+        except tk.TclError:
+            pass
+        # 内容宽度精确落位用更长的防抖单独安排：它比布局收尾贵一个数量级，
+        # 如果跟着 90ms 的防抖走，拖动中几乎每帧都会触发一次，节流就白做了
+        try:
+            if getattr(self, "_content_timer", None):
+                self.root.after_cancel(self._content_timer)
+            self._content_timer = self.root.after(RESIZE_CONTENT_SETTLE_MS,
+                                                  self._on_content_settled)
         except tk.TclError:
             pass
         # 全局窗口缩放时，强制重置统计图尺寸缓存、启动防抖重绘，
@@ -75,6 +104,48 @@ class RefreshMixin:
                 pass
         if self.current_page == "stats":
             self._stats_redraw_timer = self.root.after(60, self._draw_stats)
+
+    def _on_resize_settled(self):
+        """缩放停手后的**布局**收尾（内容宽度重排见 ``_on_content_settled``）。
+
+        这里**不调用** ``refresh()``：窗口尺寸变化只影响布局，数据一点没变，
+        重新查库纯属浪费。一次完整刷新要跑二十来条 SQL 加图标查询，而拖拽
+        过程中 <Configure> 来得比这快得多，一旦在缩放路径上跑完整刷新就会
+        形成「慢帧 -> 定时器到期 -> 完整刷新 -> 更慢」的雪球，这正是
+        「时间条适配慢」的真正原因。
+
+        数据更新交给原本每 2 秒一次的 ``_refresh_loop``，缩放只做布局。
+        """
+        self._resize_timer = None
+        try:
+            # 布局模式（并排 <-> 竖排）可能翻转，这一步只在真翻转时动 grid，
+            # 所以可以保持 90ms 的响应速度
+            self._relayout_home_cards()
+            self._relayout_categories()
+        except Exception as exc:  # noqa: BLE001
+            self._log_error("resize_relayout", exc)
+        try:
+            self.root.after_idle(self._refresh_card_widths)
+        except tk.TclError:
+            pass
+
+    def _on_content_settled(self):
+        """内容宽度精确落位。
+
+        拖动过程中内容宽度是「量化 + 限流」跟进的，可能停在离目标不足一个
+        量化步长的位置；真正停手后在这里补一次精确值，保证缩到最小时右侧
+        不留误差（也不会因为差几个像素而被裁）。
+        """
+        self._content_timer = None
+        try:
+            force_all_content_resize()
+        except Exception as exc:  # noqa: BLE001
+            self._log_error("resize_content", exc)
+        # 内容宽度变了，卡片宽度要等几何计算落地后才拿得到，放进 idle
+        try:
+            self.root.after_idle(self._refresh_card_widths)
+        except tk.TclError:
+            pass
 
     def _show_day_banner(self):
         """跨 0 点后显示提示横幅：新的一天已开始，数据已切换到今日。"""
@@ -113,6 +184,7 @@ class RefreshMixin:
         if self._last_refresh_date is not None and self._last_refresh_date != today:
             self._rows_sig.clear()
             self._card_widths.clear()
+            self._card_applied_width.clear()
             self._records_sig = None
             self._records_dirty = True
             self._stats_fixed_size = None

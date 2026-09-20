@@ -14,6 +14,7 @@ from tkinter import messagebox, ttk
 from .. import theme
 from ..config import project_root
 from ..widgets import RoundedButton, ScrollArea, rounded_polygon
+from .common import wrap_to_area
 
 
 class SettingsPageMixin:
@@ -22,7 +23,9 @@ class SettingsPageMixin:
     # ---------- 设置页 ----------
     def _build_settings(self):
         page = self.pages["settings"]
-        sc = ScrollArea(page, bg=theme.BG, min_width=680)
+        # 同 records 页：min_width 不能超过最小窗口的可用宽度（760 - 160 = 600），
+        # 否则缩到最小时右侧内容要横向滚动才能看到
+        sc = ScrollArea(page, bg=theme.BG, min_width=560)
         sc.pack(fill="both", expand=True)
         inner = sc.inner
         tk.Label(inner, text="设置", font=theme.font(22, True), fg=theme.TEXT_TITLE,
@@ -91,6 +94,7 @@ class SettingsPageMixin:
         self.db_path_label = tk.Label(sec5, text=str(self.db.db_path),
                                       font=theme.font(9), fg=theme.SUB, bg=theme.BG)
         self.db_path_label.pack(anchor="w", pady=(4, 8))
+        wrap_to_area(self.db_path_label, sc)
         RoundedButton(sec5, text="打开数据目录", width=130, height=32, radius=theme.CONTROL_RADIUS,
                       font=theme.font(10), fill=theme.SECONDARY_BG, fg=theme.TEXT,
                       command=lambda: os.startfile(str(self.db.db_path.parent)),
@@ -103,6 +107,8 @@ class SettingsPageMixin:
         self.settings_now_label = tk.Label(sec6, text="--", font=theme.font(10),
                                            fg=theme.SUB, bg=theme.BG, justify="left")
         self.settings_now_label.pack(anchor="w", pady=6)
+        # 窗口标题长度不可控，不换行会把整页内容撑宽
+        wrap_to_area(self.settings_now_label, sc)
 
     def _save_settings(self):
         try:

@@ -69,7 +69,10 @@ class RecordsPageMixin:
     # ---------- 详细记录页 ----------
     def _build_records(self):
         page = self.pages["records"]
-        sc = ScrollArea(page, bg=theme.BG, min_width=680)
+        # min_width 必须 ≤ 最小窗口可用宽度，否则窗口缩到最小时内容比画布宽，
+        # 右侧会被挤到横向滚动条外（最小窗口 760 - 侧边栏 160 = 600 逻辑像素，
+        # 再给竖向滚动条留一点余量）
+        sc = ScrollArea(page, bg=theme.BG, min_width=560)
         sc.pack(fill="both", expand=True)
         inner = sc.inner
         tk.Label(inner, text="详细记录", font=theme.font(22, True), fg=theme.TEXT_TITLE,

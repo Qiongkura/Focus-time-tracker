@@ -80,6 +80,15 @@ class ScreenTimeApp(
         self._card_rows = {}
         self._card_heights = {}
         self._card_widths = {}  # 最近一次成功布局的卡片宽度缓存（窗口未布局时兜底）
+        self._card_widgets = {}  # card_key -> 卡片控件，窗口缩放时做轻量重排
+        self._card_payload = {}  # card_key -> 最近一次的数据，缩放时不必重新查库
+        self._card_bound = set()  # 已挂上 <Configure> 的 card_key，避免重复绑定
+        self._card_applied_width = {}  # card_key -> 已排布的行内容宽度（缩放短路用）
+        self._card_autosize = set()  # 高度跟随内容的卡片（分类页），首页卡片不在此列
+        self._home_card_mode = None  # 首页双卡片布局模式：side / stack
+        self._cat_card_mode = None  # 分类三卡布局模式：side / stack
+        self._resize_timer = None  # 窗口缩放防抖定时器（布局收尾）
+        self._content_timer = None  # 窗口缩放防抖定时器（内容宽度精确落位）
         self._last_refresh_date = None  # 跨 0 点检测：上次刷新时的日期
         self._card_total_labels = {}
         self._records_dirty = True

@@ -57,15 +57,24 @@ class CategoriesPageMixin:
                                                minsize=theme.scale(360))
 
     def _relayout_categories(self):
-        """分类三卡：横向放得下就三栏并排，放不下自动竖排。"""
+        """分类三卡：横向放得下就三栏并排，放不下自动竖排。
+
+        只在布局模式真正切换时才动 grid；重复调用直接返回，避免
+        每次缩放都 grid_forget + grid 引发 <Configure> 级联重绘。
+        """
         w = self.cat_grid.winfo_width()
         if w <= 10:
             return
+        # 卡片内容需要至少 360 逻辑宽度，三栏阈值相应提高，保证不裁内容
+        mode = "side" if w >= theme.scale(360) * 3 + theme.scale(16) else "stack"
+        if mode == self._cat_card_mode:
+            return
+        self._cat_card_mode = mode
+
         cards = list(self.cat_cards.values())
         for c in cards:
             c["card"].grid_forget()
-        # 卡片内容需要至少 360 逻辑宽度，三栏阈值相应提高，保证不裁内容
-        if w >= theme.scale(360) * 3 + theme.scale(16):
+        if mode == "side":
             for i, c in enumerate(cards):
                 c["card"].grid(row=0, column=i, sticky="nsew",
                                padx=theme.scale(8), pady=theme.scale(4))
@@ -120,6 +129,7 @@ class CategoriesPageMixin:
                                 theme.CATEGORY_META[cat][1], show_pct=True, full_name=True,
                                 actions=True)
             # 卡片高度按各行实际高度累加（名称换行时行高自动加高），保证全部进程/网站完整显示
+            self._card_autosize.add(key)
             h = self._card_heights.get(key)
             if h:
                 widgets["card"].configure(height=int(h))

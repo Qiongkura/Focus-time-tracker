@@ -21,9 +21,28 @@ from .common import shorten, site_display
 
 MAX_ROWS = 5
 
+# 行内容的最小可用宽度（逻辑像素）：再窄就会挤到名称/时长，不如给个下限
+CONTENT_MIN_WIDTH = 280
+# 名称列预留宽度：图标列 + 右侧时长列
+NAME_RESERVE = 150
+# 重建判据的宽度量化步长：拖窗口时 1px 抖动不必整行重建，
+# 平滑伸缩交给 _apply_card_widths 逐帧改宽度完成
+WIDTH_QUANTIZE_STEP = 24
+
 
 class HomePageMixin:
     """首页概览卡片与时段切换。"""
+
+    # ---------- 尺寸换算 ----------
+
+    def _content_width(self, card_width: float) -> int:
+        """卡片宽度 -> 行内容可用宽度（两侧各留 16 逻辑像素）。"""
+        return int(max(theme.scale(CONTENT_MIN_WIDTH), card_width - theme.scale(32)))
+
+    @staticmethod
+    def _quantize_width(width: int) -> int:
+        step = max(1, int(theme.scale(WIDTH_QUANTIZE_STEP)))
+        return int(width // step) * step
 
     # ---------- 首页 ----------
     def _build_home(self):
@@ -106,15 +125,26 @@ class HomePageMixin:
         return card
 
     def _relayout_home_cards(self):
-        """首页双卡片：横向放得下就并排，放不下自动竖排。"""
+        """首页双卡片：横向放得下就并排，放不下自动竖排。
+
+        只在「并排 <-> 竖排」真正切换时才动 grid。重复调用直接返回——
+        否则每次缩放都要 grid_forget + grid，会引发一大串 <Configure>
+        级联重绘（卡片、行、进度条、圆角画布全都要重画），这正是
+        「缩放时时间条适配慢」的主要来源。
+        """
         cards = self.app_card.master
         w = cards.winfo_width()
         if w <= 10:
             return
+        card_w = (w - theme.scale(16)) / 2.0
+        mode = "side" if card_w >= theme.scale(300) else "stack"
+        if mode == self._home_card_mode:
+            return
+        self._home_card_mode = mode
+
         for c in (self.app_card, self.site_card):
             c.grid_forget()
-        card_w = (w - theme.scale(16)) / 2.0
-        if card_w >= theme.scale(300):
+        if mode == "side":
             self.app_card.grid(row=0, column=0, sticky="nsew",
                                padx=theme.scale(8), pady=theme.scale(4))
             self.site_card.grid(row=0, column=1, sticky="nsew",
@@ -122,9 +152,16 @@ class HomePageMixin:
             cards.grid_columnconfigure(0, weight=1, uniform="hcard")
             cards.grid_columnconfigure(1, weight=1, uniform="hcard")
         else:
+            # 竖排：必须清掉横向模式遗留的列配置。否则 column 1 的
+            # weight=1 + uniform="hcard" 仍然生效，两列继续五五分，
+            # 卡片只拿到一半宽度——行内容比卡片宽，右侧时长会被画布裁掉。
+            # （分类页的 _relayout_categories 一直有这一步，首页漏了。）
+            cards.grid_columnconfigure(1, weight=0, uniform="", minsize=0)
+            cards.grid_columnconfigure(0, weight=1, uniform="", minsize=0)
             self.app_card.grid(row=0, column=0, sticky="ew", pady=theme.scale(6))
             self.site_card.grid(row=1, column=0, sticky="ew", pady=theme.scale(6))
-            cards.grid_columnconfigure(0, weight=1)
+        # 重排后卡片宽度已变，立刻按新宽度刷一遍行宽（不等下一次刷新）
+        self.root.after_idle(self._refresh_card_widths)
 
     def set_period(self, period: str):
         self.period = period
@@ -175,6 +212,16 @@ class HomePageMixin:
 
     def _sync_card(self, card, card_key, items, total, fill, bar_color,
                    show_pct=False, full_name=False, actions=False):
+        # 记住控件与本次数据：窗口缩放时靠它们做「只改宽度」的轻量重排，
+        # 不必重新查库、也不必重建行控件
+        self._card_widgets[card_key] = card
+        self._card_payload[card_key] = (items, total, fill, bar_color,
+                                        show_pct, full_name, actions)
+        # 卡片尺寸变化 -> 只更新行宽（每帧调用，成本极低），时间条才会跟手
+        if card_key not in self._card_bound:
+            self._card_bound.add(card_key)
+            card.bind("<Configure>", lambda _e, k=card_key: self._on_card_resize(k), add="+")
+
         # 窗口未布局/最小化时 winfo_width 可能返回 1，用缓存宽度兜底，避免
         # 以 1px 宽度重建行导致布局异常；布局成功后更新缓存
         w = card.winfo_width()
@@ -182,8 +229,9 @@ class HomePageMixin:
             self._card_widths[card_key] = w
         else:
             w = self._card_widths.get(card_key, theme.scale(640))
-        width = max(theme.scale(280), w - theme.scale(32))
-        sig = (width, [it["name"] for it in items])
+        width = self._content_width(w)
+        # 量化后再比较：宽度只差几像素时不重建，交给 _apply_card_widths 伸缩
+        sig = (self._quantize_width(width), [it["name"] for it in items])
         if self._rows_sig.get(card_key) != sig:
             # 重建必须“原子化”：只有重建成功才更新 sig；若中途异常（比如
             # 图标/控件创建失败），清空行引用并抛出，由上层记录日志。
@@ -202,6 +250,72 @@ class HomePageMixin:
         else:
             self._update_card_rows(card_key, items, total, show_pct, full_name)
 
+    def _on_card_resize(self, card_key):
+        """卡片尺寸变化：只更新行宽/换行/行高，不重建控件。
+
+        拖窗口时这个方法每帧都会被调用，因此必须廉价——只改属性与坐标，
+        不创建任何控件、不查库。时间条靠它跟着窗口边缘实时伸缩。
+        """
+        try:
+            self._apply_card_widths(card_key)
+        except Exception as exc:  # noqa: BLE001
+            self._log_error("card_resize", exc)
+
+    def _apply_card_widths(self, card_key):
+        """按卡片当前宽度重排行内布局（宽度、换行、行高、纵向位置）。
+
+        这个方法在拖窗口时每帧都会被调用，因此做了严格短路：
+        * 宽度没变 -> 立刻返回（``<Configure>`` 会因为各种原因重复触发）；
+        * 换行宽度没变 -> 不碰 ``wraplength``，也就不必重算 ``winfo_reqheight()``
+          （那会强制 Tk 重排文本，是这条路径上最贵的一步）；
+        * 行高没变 -> 不调 ``configure(height=...)``。
+        """
+        rows = self._card_rows.get(card_key)
+        card = self._card_widgets.get(card_key)
+        if not rows or card is None:
+            return
+        w = card.winfo_width()
+        if w <= 10:
+            return
+        width = self._content_width(w)
+        if self._card_applied_width.get(card_key) == width:
+            return
+        self._card_applied_width[card_key] = width
+        self._card_widths[card_key] = w
+
+        name_area = max(theme.scale(120), width - theme.scale(NAME_RESERVE))
+        y = theme.scale(54)
+        for info in rows:
+            if info.get("name_area") != name_area:
+                info["name_area"] = name_area
+                info["name"].config(wraplength=name_area)
+                # 名称换行行数变化会改变所需行高，这里同步重算，避免文字被压掉
+                info["row_h"] = (max(theme.scale(58),
+                                     info["name"].winfo_reqheight() + theme.scale(36))
+                                 + info["extra_h"])
+            if info.get("applied_row_h") != info["row_h"]:
+                info["applied_row_h"] = info["row_h"]
+                info["row"].configure(height=info["row_h"])
+            card.itemconfigure(info["win"], width=width)
+            card.coords(info["win"], theme.scale(16), y)
+            y += info["row_h"] + theme.scale(6)
+        height = y + theme.scale(10)
+        self._card_heights[card_key] = height
+        # 分类页的卡片高度跟随内容（首页卡片是固定高度，不在此列）
+        if card_key in self._card_autosize and card.winfo_height() != int(height):
+            card.configure(height=int(height))
+
+    def _refresh_card_widths(self):
+        """把所有已知卡片的行宽刷到当前尺寸。
+
+        缩放路径专用：只改宽度与坐标，不查库、不重建控件。
+        """
+        for card_key in list(self._card_rows):
+            try:
+                self._apply_card_widths(card_key)
+            except Exception as exc:  # noqa: BLE001
+                self._log_error("card_resize", exc)
+
     def _build_card_rows(self, card, card_key, items, fill, bar_color, width,
                          show_pct=False, full_name=False, actions=False):
         rows = []
@@ -209,7 +323,7 @@ class HomePageMixin:
             items = [{"icon": None, "name": "今日暂无记录", "seconds": 0, "category": ""}]
         y = theme.scale(54)
         # 名称可用宽度：预留图标列与右侧时长列后，超长名称自动换行显示完整
-        name_area = max(theme.scale(120), width - theme.scale(150))
+        name_area = max(theme.scale(120), width - theme.scale(NAME_RESERVE))
         for it in items:
             # 单行防御：某一行构建失败（如控件/图标异常）只跳过该行，
             # 不拖垮整张卡片，保证其他行正常显示
@@ -261,14 +375,21 @@ class HomePageMixin:
                     actions_frame.grid(row=2, column=1, columnspan=2, sticky="e",
                                        padx=(0, theme.scale(16)), pady=(2, theme.scale(4)))
                 row.grid_columnconfigure(1, weight=1)  # 时间条列吸收窗口缩放
-                card.create_window(theme.scale(16), y, window=row, anchor="nw",
-                                   width=width, tags="rowwin")
+                win = card.create_window(theme.scale(16), y, window=row, anchor="nw",
+                                         width=width, tags="rowwin")
+                # 记录 row/win/extra_h：窗口缩放时 _apply_card_widths 靠它们
+                # 直接改宽度与坐标，避免重建控件
                 rows.append({"icon": icon_lbl, "name": name_lbl, "bar": bar,
-                             "time": time_lbl, "actions": actions_frame})
+                             "time": time_lbl, "actions": actions_frame,
+                             "row": row, "win": win, "extra_h": extra_h,
+                             "name_area": name_area, "row_h": row_h,
+                             "applied_row_h": row_h})
                 y += row_h + theme.scale(6)
             except Exception:
                 continue
         self._card_rows[card_key] = rows
+        # 本次已按 width 排好，记下来让 _apply_card_widths 的短路生效
+        self._card_applied_width[card_key] = width
         # 记录卡片内容总高度（头部 + 各行实际高度 + 底部留白），供卡片高度自适应
         self._card_heights[card_key] = y + theme.scale(10)
 

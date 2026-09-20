@@ -4,6 +4,7 @@ from __future__ import annotations
 import os
 import time
 import tkinter as tk
+import weakref
 from pathlib import Path
 
 from . import theme
@@ -352,6 +353,10 @@ def clear_icon_caches():
     _DEFAULT_ICON = None
     _GLOBE_ICON = None
     _ICON_CACHE.clear()
+    # 品牌 logo 也是 PhotoImage，同样绑在某个 Tk 解释器上。漏清这一项时，
+    # 换一个 root（重建窗口 / 测试里反复建窗口）后会拿着上一个解释器的图片名
+    # 去 create_image，直接抛 "image pyimageN doesn't exist"。
+    _BRAND_LOGO_CACHE.clear()
 
 
 def set_icon_root(root):
@@ -680,7 +685,25 @@ class ScrollableFrame(tk.Frame):
 
 
 class ScrollArea(tk.Frame):
-    """横向 + 纵向双滚动容器：内容宽度 = max(画布可视宽度, 内容最小宽度)。"""
+    """横向 + 纵向双滚动容器：内容宽度 = max(画布可视宽度, 内容最小宽度)。
+
+    内容宽度一变，整块内容区都要重排并重绘（首页约 85 个控件）。实测这条
+    路径在本机要 60~90ms，比拖动窗口时事件到达的间隔还长——如果每帧都付
+    一次，事件循环就会被撑满，表现就是「缩放时时间条适配太慢」。
+
+    所以把「跟随窗口宽度」拆成两条路径：
+
+    * 拖动过程中：宽度变化不足 ``CONTENT_STEP`` 就不动；两次重排之间至少隔
+      ``CONTENT_INTERVAL_MS``，避免每帧都付全量重排的代价；
+    * 停手之后：由 ``force_resize_content()`` 按最终宽度精确重排一次。
+
+    这样窗口本身持续跟手，内容以固定节奏跟到新宽度，落点仍然精确。
+    """
+
+    # 内容重排的宽度量化步长（逻辑像素）：变化不足一步就不值得重排
+    CONTENT_STEP = 24
+    # 两次内容重排之间的最小间隔（毫秒）：重排会重绘整个内容区，必须限流
+    CONTENT_INTERVAL_MS = 160
 
     def __init__(self, master, bg: str = theme.BG, min_width: int = 620,
                  respect_req: bool = True, **kw):
@@ -706,14 +729,22 @@ class ScrollArea(tk.Frame):
         self._v_on = True
         self._h_on = True
         self._sync_pending = False
+        # 内容宽度节流状态（见类文档）
+        self._applied_content_width = None   # 上一次真正排布的宽度
+        self._wanted_content_width = None    # 最近一次期望的宽度
+        self._last_content_apply = 0.0
+        self._content_apply_timer = None
         self.inner.bind("<Configure>", lambda _e: self._schedule_sync())
         self.canvas.bind("<Configure>", lambda e: self._resize_content(e.width))
         self.canvas.bind("<MouseWheel>", self._on_wheel)
         self.inner.bind("<MouseWheel>", self._on_wheel)
         self.inner.bind("<Shift-MouseWheel>", self._on_shift_wheel)
         self.canvas.bind("<Shift-MouseWheel>", self._on_shift_wheel)
+        # 重新映射（切页/取消最小化）时解除节流：这一次布局要立刻生效
+        self.bind("<Map>", lambda _e: self._reset_content_throttle(), add="+")
         self._sync_timer = None
         self._periodic_sync()
+        _ALL_SCROLL_AREAS.add(self)
 
     def _schedule_sync(self):
         """防抖滚动同步：批量创建子控件时避免每个 Configure 都重算 bbox。"""
@@ -768,18 +799,102 @@ class ScrollArea(tk.Frame):
         finally:
             self._syncing = False
 
-    def _resize_content(self, canvas_width: int):
+    def _target_content_width(self, canvas_width: int):
+        """按当前画布宽度算内容应该多宽；算不出来返回 None。"""
         try:
             if self._respect_req:
                 req = self.inner.winfo_reqwidth()
-                width = max(int(canvas_width), int(req), int(self._min_width))
-            else:
-                # 不强制保持内容最小宽度，允许内容随窗口变窄重排（如卡片竖排）
-                width = max(int(canvas_width), int(self._min_width))
-            self.canvas.itemconfig(self._win, width=width)
-            self._schedule_sync()
+                return max(int(canvas_width), int(req), int(self._min_width))
+            return max(int(canvas_width), int(self._min_width))
         except tk.TclError:
-            pass
+            return None
+
+    def _resize_content(self, canvas_width: int):
+        """画布尺寸变化 -> 按节流规则决定要不要重排内容。
+
+        这个方法在拖窗口时每帧都会被调用，所以先做两道短路（量化 + 限流），
+        把「重排整个内容区」这种昂贵动作压到固定节奏上。
+        """
+        width = self._target_content_width(canvas_width)
+        if width is None:
+            return
+        self._wanted_content_width = width
+        applied = self._applied_content_width
+        if applied is None:
+            # 首次布局：直接落位，不必等节流
+            self._apply_content_width(width)
+            return
+        step = max(1, int(theme.scale(self.CONTENT_STEP)))
+        if abs(width - applied) < step:
+            # 只差几像素，重排一次要重绘整块内容区，不划算
+            return
+        elapsed_ms = (time.monotonic() - self._last_content_apply) * 1000.0
+        if elapsed_ms < self.CONTENT_INTERVAL_MS:
+            # 距上次重排太近：记下期望宽度，等节流窗口结束再落位
+            self._schedule_content_apply(self.CONTENT_INTERVAL_MS - elapsed_ms)
+            return
+        self._apply_content_width(width)
+
+    def _reset_content_throttle(self):
+        """解除限流，让下一次布局立刻生效（切页 / 重新映射时用）。"""
+        self._last_content_apply = 0.0
+
+    def _schedule_content_apply(self, delay_ms: float):
+        if self._content_apply_timer is not None:
+            return
+        try:
+            self._content_apply_timer = self.after(max(1, int(delay_ms)),
+                                                   self._run_content_apply)
+        except tk.TclError:
+            self._content_apply_timer = None
+
+    def _run_content_apply(self):
+        self._content_apply_timer = None
+        width = self._wanted_content_width
+        if width is None:
+            return
+        step = max(1, int(theme.scale(self.CONTENT_STEP)))
+        if self._applied_content_width is not None and \
+                abs(width - self._applied_content_width) < step:
+            return
+        self._apply_content_width(width)
+
+    def _apply_content_width(self, width: int):
+        try:
+            self.canvas.itemconfig(self._win, width=width)
+        except tk.TclError:
+            return
+        self._applied_content_width = width
+        self._last_content_apply = time.monotonic()
+        self._schedule_sync()
+
+    def force_resize_content(self):
+        """按当前画布宽度精确重排一次（跳过量化与限流）。
+
+        窗口缩放停手后调用，保证最终宽度不留量化误差。
+        """
+        if self._content_apply_timer is not None:
+            try:
+                self.after_cancel(self._content_apply_timer)
+            except tk.TclError:
+                pass
+            self._content_apply_timer = None
+        try:
+            canvas_width = self.canvas.winfo_width()
+        except tk.TclError:
+            return
+        if canvas_width <= 10:
+            return
+        width = self._target_content_width(canvas_width)
+        if width is None:
+            return
+        self._wanted_content_width = width
+        if width != self._applied_content_width:
+            self._apply_content_width(width)
+        # 解开限流：内容宽度刚变过，滚动条显隐会紧接着再改一次画布宽度，
+        # 那一次必须立刻生效，否则要等下一个节流窗口（表现为「松手后要等
+        # 好几百毫秒才落位」）。下一次真正重排后限流会自然重新生效。
+        self._last_content_apply = 0.0
 
     def _on_wheel(self, event):
         self.canvas.yview_scroll(int(-event.delta / 120), "units")
@@ -788,6 +903,26 @@ class ScrollArea(tk.Frame):
         self.canvas.xview_scroll(int(-event.delta / 120), "units")
 
 
+# 所有滚动容器的弱引用集合：窗口缩放停手后统一做一次精确重排
+_ALL_SCROLL_AREAS: "weakref.WeakSet[ScrollArea]" = weakref.WeakSet()
+
+
+def force_all_content_resize():
+    """把所有可见滚动容器的内容宽度刷到最终值。
+
+    窗口缩放停手后调用：拖动过程中的重排是节流 + 量化的，这里补一次精确落位，
+    保证最终不留像素误差（否则「缩到最小」时右侧可能差几个像素）。
+    """
+    for area in list(_ALL_SCROLL_AREAS):
+        try:
+            if not area.winfo_exists() or not area.winfo_ismapped():
+                continue
+        except tk.TclError:
+            continue
+        try:
+            area.force_resize_content()
+        except tk.TclError:
+            pass
 class FlowFrame(tk.Frame):
     """栅格流式布局：子控件按固定宽度自动换行。"""
 
