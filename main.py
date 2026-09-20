@@ -13,6 +13,7 @@
 from __future__ import annotations
 
 import argparse
+import sqlite3
 from datetime import datetime, timedelta
 from pathlib import Path
 
@@ -223,6 +224,55 @@ def cmd_doctor(args):
     print("自检完成。")
 
 
+def cmd_backup(args):
+    """把数据库备份到指定文件。
+
+    用 SQLite 的在线备份 API 而不是直接复制文件：WAL 模式下最近的记录可能
+    还留在 ``-wal`` 文件里，直接 copy 会丢数据。
+    """
+    _, cfg, db_path, _ = _setup_paths()
+    if not db_path.exists():
+        print(f"数据库不存在，无需备份：{db_path}")
+        return
+
+    if args.out:
+        target = Path(args.out)
+    else:
+        target = db_path.with_name(f"{db_path.name}.bak-{datetime.now():%Y%m%d_%H%M%S}")
+    target.parent.mkdir(parents=True, exist_ok=True)
+
+    with _open_db(db_path, cfg) as db:
+        with sqlite3.connect(str(target)) as dest:
+            db.conn.backup(dest)
+
+    size_mb = target.stat().st_size / 1024 / 1024
+    print(f"已备份到：{target}（{size_mb:.2f} MB）")
+
+
+def cmd_restore(args):
+    """从备份文件恢复数据库（会覆盖当前数据库）。"""
+    _, cfg, db_path, _ = _setup_paths()
+    source = Path(args.source)
+    if not source.exists():
+        print(f"备份文件不存在：{source}")
+        return
+
+    if db_path.exists() and not args.force:
+        print(f"目标数据库已存在：{db_path}")
+        print("恢复会覆盖当前数据。确认后请加 --force 重试；"
+              "建议先执行 python main.py backup 保留现状。")
+        return
+
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    with sqlite3.connect(str(source)) as src:
+        with _open_db(db_path, cfg) as db:
+            src.backup(db.conn)
+
+    with sqlite3.connect(str(db_path)) as conn:
+        total = conn.execute("SELECT COUNT(*) FROM sessions").fetchone()[0]
+    print(f"已从 {source} 恢复，共 {total} 条记录")
+
+
 def cmd_demo(args):
     from tracker.demo import seed_demo_data
 
@@ -247,6 +297,11 @@ def main():
     p_doctor = sub.add_parser("doctor", help="自检：残留锁 / 重叠记录 / 数据库体积")
     p_doctor.add_argument("--days", type=int, default=7, help="重叠检查回溯天数（默认 7）")
     p_doctor.add_argument("--limit", type=int, default=20, help="最多列出多少组重叠（默认 20）")
+    p_backup = sub.add_parser("backup", help="备份数据库（含 WAL 中的最新数据）")
+    p_backup.add_argument("--out", default="", help="备份文件路径，默认 data/usage.db.bak-<时间戳>")
+    p_restore = sub.add_parser("restore", help="从备份恢复数据库（会覆盖当前数据）")
+    p_restore.add_argument("source", help="备份文件路径")
+    p_restore.add_argument("--force", action="store_true", help="确认覆盖当前数据库")
     p_game = sub.add_parser("game", help="游戏识别规则诊断")
     g_sub = p_game.add_subparsers(dest="action", required=True)
     g_sub.add_parser("rules", help="打印当前生效的游戏识别规则")
@@ -265,6 +320,8 @@ def main():
         "demo": cmd_demo,
         "unlock": cmd_unlock,
         "doctor": cmd_doctor,
+        "backup": cmd_backup,
+        "restore": cmd_restore,
         "game": cmd_game,
     }
     handlers[args.command](args)

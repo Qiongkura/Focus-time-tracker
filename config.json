@@ -1,8 +1,12 @@
 {
   "poll_interval_seconds": 1.0,
   "min_session_seconds": 3,
+  "checkpoint_seconds": 45.0,
   "exclude_processes": [],
   "browser_site_tracking": true,
   "data_dir": "data",
-  "report_dir": "reports"
+  "report_dir": "reports",
+  "retention_days": 0,
+  "store_full_url": true,
+  "strip_url_query": true
 }

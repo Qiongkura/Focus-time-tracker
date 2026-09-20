@@ -37,11 +37,13 @@
 
 ## 架构设计
 
-- **采集层**（`tracker/monitor.py`）：Win32 API 轮询前台窗口，每 2 秒采样一次，识别窗口进程、标题、路径，调用分类引擎判定类别，写入 SQLite
+- **采集层**（`tracker/monitor.py`）：按职责拆成 `WindowSampler`（取前台窗口）、`SessionAccumulator`（切段与 checkpoint）、`SessionWriter`（落库）、`TrackingService`（编排主循环）；模块级 `run_tracking` / `get_foreground_info` 接口保持不变
 - **分类引擎**（`tracker/games.py`）：规则引擎优先级为「手动覆盖 > 游戏规则 > 网站 > 应用」，规则支持 path_keywords / process_suffix / process_exact / 排除规则
 - **浏览器识别**（`tracker/browser.py`）：匹配 Chrome / Edge / Firefox 的历史数据库（SQLite），提取当前正在访问的网站域名
-- **存储层**（`tracker/db.py`）：SQLite WAL 模式，支持 GUI 并发读取和后台写入；按天自动拆分跨午夜会话
-- **GUI 层**（`tracker/app.py`）：五个页面（首页/统计/详细记录/分类/设置），浅色主题，圆角控件，左侧导航栏
+- **存储层**（`tracker/db.py`）：SQLite WAL 模式，支持 GUI 并发读取和后台写入；按天自动拆分跨午夜会话；`metadata` 表记录 schema 版本，分类回填只在版本升级或规则文件变化时执行
+- **互斥采集**（`tracker/lock.py`）：`os.open(O_CREAT | O_EXCL)` 原子抢锁，锁操作失败时 fail-closed（拒绝启动而不是放行），并校验进程创建时间以防 PID 复用误判
+- **隐私与保留**（`tracker/privacy.py`）：URL 落库策略（剥离 query/fragment、可选只存域名）与历史保留天数清理
+- **GUI 层**（`tracker/app.py`）：五个页面（首页/统计/详细记录/分类/设置），浅色主题，圆角控件，左侧导航栏；前台窗口预览由后台线程采样，主线程只读结果，不阻塞界面
 - **系统托盘**（`tracker/tray.py`）：最小化到托盘继续记录，支持恢复主界面和退出
 
 ## 📦 环境依赖
@@ -77,7 +79,10 @@ python -m pip install pillow        # 建议安装，用于图标 / Logo
 | `python main.py now` | 查看当前前台窗口信息（诊断用） |
 | `python main.py game rules` | 打印当前生效的游戏识别规则 |
 | `python main.py game check --path "C:\Riot Games\VALORANT\live\VALORANT.exe" --process VALORANT.exe` | 按规则判断某个进程/路径是否为游戏 |
+| `python main.py doctor` | 自检：残留锁 / 重叠记录 / 数据库体积 / 隐私策略 |
 | `python main.py unlock` | 清除残留采集锁 |
+| `python main.py backup [--out 路径]` | 备份数据库（含 WAL 中的最新数据） |
+| `python main.py restore 备份文件 --force` | 从备份恢复数据库（覆盖当前数据） |
 | `python main.py demo` | 生成 7 天示例数据，便于预览 |
 
 ## 📝 使用示例
@@ -111,13 +116,20 @@ python main.py demo
 
 | 配置项 | 说明 | 默认 |
 | --- | --- | --- |
-| `poll_interval_seconds` | 采样间隔（秒），调小更精确、调大更省资源 | `1.0` |
+| `poll_interval_seconds` | 采样间隔（秒），调小更精确、调大更省资源；低于 `0.2` 会被自动提到 `0.2` | `1.0` |
 | `min_session_seconds` | 短于该时长的窗口切换不记录，避免碎片数据 | `3` |
 | `checkpoint_seconds` | 长会话每隔该秒数落盘一段，进程被强杀/断电时最多丢这一段 | `45` |
-| `exclude_processes` | 不想统计的进程名，如 `["explorer.exe"]` | `["python.exe"]` |
+| `exclude_processes` | 不想统计的进程名列表，如 `["explorer.exe"]`；**大小写不敏感** | `[]` |
 | `browser_site_tracking` | 是否识别浏览器正在访问的具体网站；关闭后浏览器按普通应用统计 | `true` |
 | `data_dir` | 数据目录（相对项目根目录，也可写绝对路径） | `"data"` |
 | `report_dir` | 报告目录（相对项目根目录，也可写绝对路径） | `"reports"` |
+| `retention_days` | 历史保留天数，`0` 表示永久保留；采集启动时清理更早的记录并 VACUUM | `0` |
+| `store_full_url` | 是否保存完整 URL；设为 `false` 时只保存 `协议://域名` | `true` |
+| `strip_url_query` | 保存 URL 时去掉 `?query` 与 `#fragment`，避免搜索词、临时 token 落盘 | `true` |
+
+配置项都有类型与取值校验：写错的字段会被就地修正（例如 `poll_interval_seconds: 0`
+会被提到 `0.2`，`exclude_processes` 写成字符串会被规整成列表），问题会写进
+`data/ui_errors.log`，不会让程序启动失败。`config.json` 未写出的项一律使用上表默认值。
 
 ### game_rules.json
 
@@ -139,12 +151,17 @@ python main.py demo
 
 ## 🧪 测试
 
-自动化测试（游戏规则、站点清洗、DB 聚合、浏览器缓存等）：
+自动化测试（游戏规则、站点清洗、DB 聚合、浏览器缓存、采集锁原子性、采集组件切段、
+配置校验、URL 隐私策略等，共 104 例）：
 
 ```bash
-python -m pip install pytest
-python -m pytest tests -q
+python -m pip install -r requirements-dev.txt
+python -m pytest
 ```
+
+Windows CI（`.github/workflows/ci.yml`）会在 Python 3.10 / 3.12 上跑 `compileall`
+语法检查与全部单测。注意 `tracker/monitor.py` 依赖 Win32 API，在非 Windows 平台
+导入时即抛错，所以 CI 必须使用 `windows-latest`。
 
 手动验证：
 - 执行 `python main.py demo` 生成示例数据，打开 GUI 检查各页面显示

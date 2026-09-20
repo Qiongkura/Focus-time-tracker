@@ -1,4 +1,4 @@
-"""macOS 浅色风格屏幕使用时间 GUI（只读展示，采集由后台子进程自动启动）。"""
+"""Windows 浅色风格屏幕使用时间 GUI（只读展示，采集由后台子进程自动启动）。"""
 from __future__ import annotations
 
 import ctypes

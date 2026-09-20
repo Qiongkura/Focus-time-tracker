@@ -1,0 +1,9 @@
+# 开发依赖：先装运行依赖，再装测试与静态检查工具
+#
+#   python -m pip install -r requirements-dev.txt
+#   python -m pytest -q
+#
+-r requirements.txt
+
+pytest>=8
+ruff>=0.6
