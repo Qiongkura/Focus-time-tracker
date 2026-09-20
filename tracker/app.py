@@ -47,6 +47,36 @@ def _enable_high_dpi():
 _enable_high_dpi()
 
 
+def rotate_log(path: Path, max_bytes: int = 1_000_000, keep: int = 3) -> None:
+    """日志超过 ``max_bytes`` 时轮转：``x.log`` → ``x.log.1`` → ``x.log.2`` …
+
+    长期运行的桌面程序如果只追加不轮转，日志会一直膨胀——用户机器上的
+    ``data/ui_errors.log`` 实测已经涨到 500KB 以上。这里保留最近 ``keep`` 份。
+    """
+    try:
+        if path.stat().st_size < max_bytes:
+            return
+    except OSError:
+        return
+
+    try:
+        path.with_name(f"{path.name}.{keep}").unlink(missing_ok=True)
+    except OSError:
+        pass
+    for index in range(keep - 1, 0, -1):
+        src = path.with_name(f"{path.name}.{index}")
+        dst = path.with_name(f"{path.name}.{index + 1}")
+        try:
+            if src.exists():
+                src.replace(dst)
+        except OSError:
+            pass
+    try:
+        path.replace(path.with_name(f"{path.name}.1"))
+    except OSError:
+        pass
+
+
 def _shorten(text: str, n: int) -> str:
     text = (text or "").strip()
     return text if len(text) <= n else text[: n - 1] + "…"
@@ -498,8 +528,8 @@ class ScreenTimeApp:
                 "ORDER BY id DESC LIMIT 1", (process,)).fetchone()
             if row and row[0]:
                 return row[0]
-        except Exception:
-            pass
+        except Exception as exc:  # noqa: BLE001
+            self._log_error("exe_lookup", exc)
         return ""
 
     def _process_item(self, a, full_name=False):
@@ -627,8 +657,9 @@ class ScreenTimeApp:
                 return [{"icon": None,
                          "name": f"今日暂无记录 · 昨日共 {fmt_minsec(secs)}{extra}",
                          "seconds": 0, "category": ""}]
-        except Exception:  # noqa: BLE001
-            pass
+        except Exception as exc:  # noqa: BLE001
+            # 界面容错不能变成「静默吞掉」：统一落日志，traceback 里有精确位置
+            self._log_error("ui", exc)
         return [{"icon": None, "name": "今日暂无记录", "seconds": 0, "category": ""}]
 
     def _update_card_rows(self, card_key, items, total, show_pct=False, full_name=False):
@@ -739,8 +770,9 @@ class ScreenTimeApp:
                 pass
         try:
             self.mini_row._relayout()  # 按新宽度重新排布，避免列宽过窄裁掉内容
-        except Exception:  # noqa: BLE001
-            pass
+        except Exception as exc:  # noqa: BLE001
+            # 界面容错不能变成「静默吞掉」：统一落日志，traceback 里有精确位置
+            self._log_error("ui", exc)
 
     # ---------- 统计页 ----------
     def _build_stats(self):
@@ -1276,8 +1308,9 @@ class ScreenTimeApp:
         try:
             now = datetime.now()
             self._refresh_categories(self._period_start(), now)
-        except Exception:  # noqa: BLE001
-            pass
+        except Exception as exc:  # noqa: BLE001
+            # 界面容错不能变成「静默吞掉」：统一落日志，traceback 里有精确位置
+            self._log_error("ui", exc)
 
     def _refresh_categories(self, start, end, snapshot=None):
         snap = snapshot or self._period_snapshot(start, end)
@@ -1527,7 +1560,8 @@ class ScreenTimeApp:
                 creationflags=0x08000000,  # CREATE_NO_WINDOW
             )
         except Exception as exc:  # noqa: BLE001
-            print("自动启动后台采集失败:", exc)
+            # pythonw 下 stdout 不可见，必须落日志才排查得到
+            self._log_error("spawn_background", exc)
             self._bg_proc = None
 
     def _stop_background_process(self):
@@ -1559,7 +1593,8 @@ class ScreenTimeApp:
                 tooltip="屏幕使用时间 · 使用时长记录",
             )
         except Exception as exc:  # noqa: BLE001
-            print("托盘初始化失败（将回退为任务栏最小化）:", exc)
+            # pythonw 下 stdout 不可见，必须落日志才排查得到
+            self._log_error("tray_init", exc)
             self._tray_enabled = False
 
     def _restore_from_tray(self):
@@ -1626,8 +1661,9 @@ class ScreenTimeApp:
         try:
             if self._stats_figs is None:
                 self._draw_stats()
-        except Exception:  # noqa: BLE001
-            pass
+        except Exception as exc:  # noqa: BLE001
+            # 界面容错不能变成「静默吞掉」：统一落日志，traceback 里有精确位置
+            self._log_error("ui", exc)
 
     def _schedule_hourly_stats(self):
         """整点刷新统计图（补上上一小时的数据）。"""
@@ -1643,8 +1679,9 @@ class ScreenTimeApp:
         try:
             if self._stats_figs is not None:
                 self._draw_stats()
-        except Exception:  # noqa: BLE001
-            pass
+        except Exception as exc:  # noqa: BLE001
+            # 界面容错不能变成「静默吞掉」：统一落日志，traceback 里有精确位置
+            self._log_error("ui", exc)
         self._schedule_hourly_stats()
 
     def _on_root_resize(self):
@@ -1679,14 +1716,16 @@ class ScreenTimeApp:
             if self._banner_timer:
                 self.root.after_cancel(self._banner_timer)
             self._banner_timer = self.root.after(8000, self._hide_day_banner)
-        except Exception:  # noqa: BLE001
-            pass
+        except Exception as exc:  # noqa: BLE001
+            # 界面容错不能变成「静默吞掉」：统一落日志，traceback 里有精确位置
+            self._log_error("ui", exc)
 
     def _hide_day_banner(self):
         try:
             self.day_banner.pack_forget()
-        except Exception:  # noqa: BLE001
-            pass
+        except Exception as exc:  # noqa: BLE001
+            # 界面容错不能变成「静默吞掉」：统一落日志，traceback 里有精确位置
+            self._log_error("ui", exc)
 
     def refresh(self):
         # 下拉框点开不选被清空时，自动恢复当前值
@@ -1747,15 +1786,21 @@ class ScreenTimeApp:
                 self._log_error("records", exc)
 
     def _log_error(self, where: str, exc: Exception):
-        """把界面刷新异常写入 data/ui_errors.log，便于排查 pythonw 下的静默错误。"""
+        """把界面异常写入 data/ui_errors.log，便于排查 pythonw 下的静默错误。
+
+        文件超过 1MB 时自动轮转（保留最近 3 份），避免长期运行无限增长。
+        """
         try:
             import traceback as _tb
             log_dir = project_root() / self.cfg.get("data_dir", "data")
             log_dir.mkdir(parents=True, exist_ok=True)
-            with open(log_dir / "ui_errors.log", "a", encoding="utf-8") as f:
+            path = log_dir / "ui_errors.log"
+            rotate_log(path)
+            with open(path, "a", encoding="utf-8") as f:
                 f.write(f"[{datetime.now():%Y-%m-%d %H:%M:%S}] {where}: {exc}\n")
                 f.write(_tb.format_exc() + "\n")
         except Exception:  # noqa: BLE001
+            # 日志本身失败时静默，绝不能反过来影响界面
             pass
 
     # ---------- 生命周期 ----------
