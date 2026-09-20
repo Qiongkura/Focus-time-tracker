@@ -5,6 +5,13 @@
 只通过 ``self`` 访问宿主窗口的公共属性（``root`` / ``db`` / ``pages`` /
 ``current_page`` 等），因此拆分不改变任何对外调用点。
 """
+from .common import shorten, site_display
+from .records_page import RecordsPageMixin
 from .stats_page import StatsPageMixin
 
-__all__ = ["StatsPageMixin"]
+__all__ = [
+    "RecordsPageMixin",
+    "StatsPageMixin",
+    "shorten",
+    "site_display",
+]
