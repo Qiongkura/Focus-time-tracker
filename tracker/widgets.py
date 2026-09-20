@@ -734,6 +734,7 @@ class ScrollArea(tk.Frame):
         self._wanted_content_width = None    # 最近一次期望的宽度
         self._last_content_apply = 0.0
         self._content_apply_timer = None
+        self._debounce_timer = None          # _schedule_sync 的 80ms 防抖
         self.inner.bind("<Configure>", lambda _e: self._schedule_sync())
         self.canvas.bind("<Configure>", lambda e: self._resize_content(e.width))
         self.canvas.bind("<MouseWheel>", self._on_wheel)
@@ -752,11 +753,12 @@ class ScrollArea(tk.Frame):
             return
         self._sync_pending = True
         try:
-            self.after(80, self._run_sync)
+            self._debounce_timer = self.after(80, self._run_sync)
         except tk.TclError:
             self._sync_pending = False
 
     def _run_sync(self):
+        self._debounce_timer = None
         self._sync_pending = False
         try:
             self.refresh_scroll()
@@ -771,6 +773,23 @@ class ScrollArea(tk.Frame):
         except tk.TclError:
             return
         self._sync_timer = self.after(400, self._periodic_sync)
+
+    def stop_timers(self):
+        """取消本容器所有排队中的 after。
+
+        ``root.destroy()`` 会删掉控件注册的 Tcl 命令，但**不会**取消已经排队的
+        定时器；到点后 Tk 就会往 stderr 刷
+        ``invalid command name "..." (after script)``。关窗前统一取消掉。
+        """
+        for attr in ("_sync_timer", "_debounce_timer", "_content_apply_timer"):
+            tid = getattr(self, attr, None)
+            if tid:
+                try:
+                    self.after_cancel(tid)
+                except (tk.TclError, ValueError):
+                    pass
+                setattr(self, attr, None)
+        self._sync_pending = False
 
     def refresh_scroll(self):
         """刷新滚动区域并决定滚动条显隐。"""
@@ -921,6 +940,15 @@ def force_all_content_resize():
             continue
         try:
             area.force_resize_content()
+        except tk.TclError:
+            pass
+
+
+def stop_all_scroll_area_timers():
+    """取消所有滚动容器的排队定时器（关窗前调用，避免 after 打到已销毁的控件）。"""
+    for area in list(_ALL_SCROLL_AREAS):
+        try:
+            area.stop_timers()
         except tk.TclError:
             pass
 class FlowFrame(tk.Frame):

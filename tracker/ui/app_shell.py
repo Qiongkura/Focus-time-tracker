@@ -14,7 +14,9 @@ from tkinter import messagebox, ttk
 
 from .. import theme, tray
 from ..config import project_root
-from ..widgets import NavButton, get_brand_logo, rounded_polygon
+from ..widgets import (
+    NavButton, get_brand_logo, rounded_polygon, stop_all_scroll_area_timers,
+)
 
 NAV_PAGES = [
     ("home", "🏠", "首页"),
@@ -228,7 +230,7 @@ class ShellMixin:
         self.root.title("屏幕使用时间 · 后台记录中")
         if not self._minimize_hint_shown:
             self._minimize_hint_shown = True
-            self.root.after(600, lambda: messagebox.showinfo(
+            self._dialog_timer = self.root.after(600, lambda: messagebox.showinfo(
                 "后台记录中",
                 "窗口已隐藏到系统托盘（任务栏右下角），后台采集不受影响。\n"
                 "双击托盘图标恢复窗口；右键托盘图标可退出。"))
@@ -245,6 +247,8 @@ class ShellMixin:
         self.shutdown()
 
     def shutdown(self):
+        self._closing = True
+        self._cancel_timers()
         self._preview.stop()
         self._stop_background_process()
         if self._tray_enabled:
@@ -255,6 +259,29 @@ class ShellMixin:
         try:
             self.root.destroy()
         except tk.TclError:
+            pass
+
+    def _cancel_timers(self):
+        """取消所有排队中的 after，然后才能安全 destroy。
+
+        ``root.destroy()`` 会把控件注册的 Tcl 命令一起删掉，但**不会**取消
+        已经排队的定时器。到点后 Tk 找不到回调命令，就往 stderr 刷
+        ``invalid command name "..." (after script)``；如果那时正好有个
+        refresh 在跑，还会顺着 `_log_error` 写进 data/ui_errors.log。
+        """
+        for attr in ("_refresh_timer", "_boot_refresh_timer", "_boot_warm_timer",
+                     "_hourly_timer", "_stats_redraw_timer", "_resize_timer",
+                     "_content_timer", "_banner_timer", "_dialog_timer"):
+            tid = getattr(self, attr, None)
+            if tid:
+                try:
+                    self.root.after_cancel(tid)
+                except (tk.TclError, ValueError):
+                    pass
+                setattr(self, attr, None)
+        try:
+            stop_all_scroll_area_timers()
+        except Exception:  # noqa: BLE001
             pass
 
     def run(self):

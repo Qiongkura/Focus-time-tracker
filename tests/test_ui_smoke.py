@@ -93,3 +93,40 @@ def test_all_pages_are_registered(gui_app):
 def test_shutdown_is_idempotent(gui_app):
     gui_app.shutdown()
     gui_app.shutdown()
+
+
+def test_shutdown_cancels_pending_timers(gui_app):
+    """关窗前必须取消所有排队的 after。
+
+    ``root.destroy()`` 会删掉控件注册的 Tcl 命令，但不会取消已经排队的定时器；
+    到点后 Tk 会往 stderr 刷 ``invalid command name "..." (after script)``，
+    如果那会儿正好有 refresh 在跑，还会顺着 `_log_error` 写进 data/ui_errors.log。
+    """
+    from tracker.widgets import _ALL_SCROLL_AREAS
+
+    app = gui_app
+    app.show_page("home")
+    for _ in range(8):
+        app.root.update()
+    app._on_root_resize()  # 排一个缩放防抖，确保确实有东西可取消
+    assert app._resize_timer is not None
+
+    app.shutdown()
+
+    for name in ("_resize_timer", "_content_timer", "_refresh_timer",
+                 "_boot_refresh_timer", "_boot_warm_timer", "_hourly_timer",
+                 "_banner_timer", "_dialog_timer"):
+        assert getattr(app, name, None) is None, f"{name} 没有取消"
+    for area in list(_ALL_SCROLL_AREAS):
+        assert area._sync_timer is None, "ScrollArea 的周期同步定时器没取消"
+        assert area._content_apply_timer is None
+        assert area._debounce_timer is None
+
+
+def test_refresh_loop_stops_after_shutdown(gui_app, monkeypatch):
+    app = gui_app
+    calls = []
+    monkeypatch.setattr(app, "refresh", lambda: calls.append(1))
+    app.shutdown()
+    app._refresh_loop()  # 即使被调用到也不该再刷新
+    assert calls == []

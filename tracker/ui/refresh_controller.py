@@ -24,7 +24,13 @@ class RefreshMixin:
 
     # ---------- 刷新循环 ----------
     def _refresh_loop(self):
-        if not self.root.winfo_exists():
+        self._refresh_timer = None
+        if getattr(self, "_closing", False):
+            return
+        try:
+            if not self.root.winfo_exists():
+                return
+        except tk.TclError:
             return
         # 防御：refresh 内部任何未预期异常都不能中断 after 链，
         # 否则界面会永久冻结（只显示最后一次成功刷新的内容）
@@ -32,7 +38,10 @@ class RefreshMixin:
             self.refresh()
         except Exception as exc:  # noqa: BLE001
             self._log_error("refresh_loop", exc)
-        self.root.after(2000, self._refresh_loop)
+        try:
+            self._refresh_timer = self.root.after(2000, self._refresh_loop)
+        except tk.TclError:
+            pass
 
     def _warm_stats(self):
         """启动后预渲染统计图，打开统计页时立即可见。"""
@@ -45,6 +54,8 @@ class RefreshMixin:
 
     def _schedule_hourly_stats(self):
         """整点刷新统计图（补上上一小时的数据）。"""
+        if getattr(self, "_closing", False):
+            return
         try:
             now = datetime.now()
             nxt = (now + timedelta(hours=1)).replace(minute=0, second=0, microsecond=0)

@@ -89,6 +89,11 @@ class ScreenTimeApp(
         self._cat_card_mode = None  # 分类三卡布局模式：side / stack
         self._resize_timer = None  # 窗口缩放防抖定时器（布局收尾）
         self._content_timer = None  # 窗口缩放防抖定时器（内容宽度精确落位）
+        self._refresh_timer = None  # 2 秒定时刷新循环
+        self._boot_refresh_timer = None  # 启动后首次刷新
+        self._boot_warm_timer = None  # 启动后统计图预热
+        self._dialog_timer = None  # 延迟弹出的提示框（关窗时要能取消）
+        self._closing = False  # 关窗流程已开始：所有定时回调直接返回
         self._last_refresh_date = None  # 跨 0 点检测：上次刷新时的日期
         self._card_total_labels = {}
         self._records_dirty = True
@@ -122,8 +127,9 @@ class ScreenTimeApp(
         self._setup_tray()
         self._spawn_background()
         self._check_overlap_sessions()
-        self.root.after(150, self._refresh_loop)  # 延迟首次刷新，窗口先显示出来
-        self.root.after(500, self._warm_stats)     # 启动后先渲染一次统计图
+        # 延迟首次刷新，窗口先显示出来；两个启动定时器都留 id，关窗时要能取消
+        self._boot_refresh_timer = self.root.after(150, self._refresh_loop)
+        self._boot_warm_timer = self.root.after(500, self._warm_stats)  # 启动后先渲染一次统计图
         self._schedule_hourly_stats()
         self._stats_redraw_timer = None
 

@@ -100,7 +100,8 @@ class BackgroundMixin:
             self._log_error("overlap_check", exc)
             return
         if pairs:
-            self.root.after(800, lambda: messagebox.showwarning(
+            # 留 id：用户可能在弹窗前的这 800ms 里就把窗口关了
+            self._dialog_timer = self.root.after(800, lambda: messagebox.showwarning(
                 "检测到重叠记录",
                 "最近 7 天存在时间重叠的会话，可能是之前同时运行过多个采集进程造成的重复统计。\n"
                 "时长采集请只使用一个后台进程。\n\n"
