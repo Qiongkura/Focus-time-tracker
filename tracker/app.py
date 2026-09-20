@@ -1574,18 +1574,24 @@ class ScreenTimeApp:
 
     # ---------- 数据校验（只读） ----------
     def _check_overlap_sessions(self):
+        """启动时只在最近 7 天内查重叠记录。
+
+        原实现是无条件全表自连接，历史数据攒到几十万条后，每次打开界面
+        都要做一遍 O(n²) 扫描。这里改成限定时间范围 + 只取是否存在，
+        完整检查交给 ``python main.py doctor``。
+        """
         try:
-            n = self.db.conn.execute(
-                "SELECT COUNT(*) FROM sessions a JOIN sessions b ON a.id < b.id "
-                "AND a.start_time < b.end_time AND b.start_time < a.end_time"
-            ).fetchone()[0]
-        except Exception:
+            since = datetime.now() - timedelta(days=7)
+            pairs = self.db.find_overlapping_sessions(since=since, limit=1)
+        except Exception as exc:  # noqa: BLE001
+            self._log_error("overlap_check", exc)
             return
-        if n:
+        if pairs:
             self.root.after(800, lambda: messagebox.showwarning(
                 "检测到重叠记录",
-                f"数据库中存在 {n} 组时间重叠的会话，可能是之前同时运行过多个采集进程造成的重复统计。\n"
-                "时长采集请只使用一个后台进程。"))
+                "最近 7 天存在时间重叠的会话，可能是之前同时运行过多个采集进程造成的重复统计。\n"
+                "时长采集请只使用一个后台进程。\n\n"
+                "如需完整检查，请在项目目录运行：python main.py doctor"))
 
     def _background_running(self) -> bool:
         try:

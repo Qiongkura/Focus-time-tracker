@@ -7,12 +7,13 @@
   python main.py report --days 7    生成近 7 天趋势图
   python main.py stats              在控制台查看今日统计
   python main.py now                查看当前前台窗口信息（诊断用）
+  python main.py doctor             自检：残留锁 / 重叠记录 / 数据库体积
   python main.py demo               生成 7 天示例数据，便于预览图表
 """
 from __future__ import annotations
 
 import argparse
-from datetime import datetime
+from datetime import datetime, timedelta
 
 from tracker.config import load_config, project_root
 from tracker.db import UsageDB
@@ -156,6 +157,56 @@ def cmd_game(args):
         print("是游戏" if result else "不是游戏")
 
 
+def cmd_doctor(args):
+    """自检：残留采集锁、时间重叠记录、数据库体积。
+
+    重叠检查原本挂在 GUI 启动路径上做全表自连接，数据量一大就会拖慢
+    启动；现在改为按需执行的独立命令，并默认只看最近若干天。
+    """
+    _, cfg, db_path, _ = _setup_paths()
+    print("屏幕使用时间 · 自检")
+    print("-" * 52)
+
+    # 1) 采集锁
+    lock = TrackingLock(cfg)
+    if lock.path.exists():
+        try:
+            content = lock.path.read_text(encoding="utf-8").strip()
+        except OSError as exc:
+            content = f"（读取失败：{exc}）"
+        print(f"[锁]   发现锁文件 {lock.path}")
+        print(f"       内容：{content}")
+        print("       确认没有采集进程在运行后，可执行 python main.py unlock 清除")
+    else:
+        print("[锁]   无残留锁文件")
+
+    # 2) 数据库
+    if not db_path.exists():
+        print(f"[库]   尚未创建：{db_path}")
+        print("-" * 52)
+        return
+
+    size_mb = db_path.stat().st_size / 1024 / 1024
+    with UsageDB(db_path) as db:
+        print(f"[库]   {db_path}")
+        print(f"       记录数 {db.count_sessions()}    体积 {size_mb:.2f} MB    "
+              f"schema v{db.schema_version()}")
+
+        since = datetime.now() - timedelta(days=args.days)
+        pairs = db.find_overlapping_sessions(since=since, limit=args.limit)
+        if pairs:
+            print(f"[重叠] 最近 {args.days} 天发现 {len(pairs)} 组时间重叠的会话：")
+            for p in pairs[:5]:
+                print(f"       #{p['a_id']} {p['a_process']:<16} {p['a_start']} ~ {p['a_end']}")
+                print(f"       #{p['b_id']} {p['b_process']:<16} {p['b_start']} ~ {p['b_end']}")
+            print("       重叠通常意味着曾同时运行多个采集进程，这段时间的时长会被重复统计。")
+        else:
+            print(f"[重叠] 最近 {args.days} 天未发现时间重叠的会话")
+
+    print("-" * 52)
+    print("自检完成。")
+
+
 def cmd_demo(args):
     from tracker.demo import seed_demo_data
 
@@ -177,6 +228,9 @@ def main():
     p_report.add_argument("--days", type=int, default=1, help="统计天数，1=今日，7=近7天（默认 1）")
     sub.add_parser("now", help="查看当前前台窗口信息（诊断用）")
     sub.add_parser("demo", help="生成 7 天示例数据，便于预览图表")
+    p_doctor = sub.add_parser("doctor", help="自检：残留锁 / 重叠记录 / 数据库体积")
+    p_doctor.add_argument("--days", type=int, default=7, help="重叠检查回溯天数（默认 7）")
+    p_doctor.add_argument("--limit", type=int, default=20, help="最多列出多少组重叠（默认 20）")
     p_game = sub.add_parser("game", help="游戏识别规则诊断")
     g_sub = p_game.add_subparsers(dest="action", required=True)
     g_sub.add_parser("rules", help="打印当前生效的游戏识别规则")
@@ -194,6 +248,7 @@ def main():
         "now": cmd_now,
         "demo": cmd_demo,
         "unlock": cmd_unlock,
+        "doctor": cmd_doctor,
         "game": cmd_game,
     }
     handlers[args.command](args)
