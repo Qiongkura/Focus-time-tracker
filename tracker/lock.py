@@ -169,6 +169,14 @@ class TrackingLock:
         self._held = False
         return existed
 
+    def holder_alive(self) -> bool:
+        """锁是否正被一个仍然存活的进程持有（只读查询，不改动锁文件）。
+
+        供 GUI 展示「后台采集是否在跑」使用。注意不要用裸 ``OpenProcess``
+        判断——刚退出但内核对象尚未回收的进程同样会让它成功返回句柄。
+        """
+        return self._holder_alive()
+
     # ---------- 内部实现 ----------
 
     def _payload(self) -> str:

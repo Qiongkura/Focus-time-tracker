@@ -160,3 +160,35 @@ def test_dead_process_lock_is_reclaimed(lock_path):
     assert lock_path.exists()                 # 进程退出但没 release，锁文件残留
 
     assert TrackingLock(path=lock_path).acquire() is True
+
+
+# ---------- holder_alive（GUI 只读查询） ----------
+
+def test_holder_alive_false_when_no_lock_file(lock_path):
+    assert TrackingLock(path=lock_path).holder_alive() is False
+
+
+def test_holder_alive_true_for_live_holder(lock_path):
+    lock = TrackingLock(path=lock_path)
+    lock.acquire()
+    assert lock.holder_alive() is True
+
+
+def test_holder_alive_false_for_dead_pid(lock_path):
+    _write_lock(lock_path, "999999999|0")
+    assert TrackingLock(path=lock_path).holder_alive() is False
+
+
+def test_holder_alive_false_for_corrupted_content(lock_path):
+    _write_lock(lock_path, "garbage-not-a-pid")
+    assert TrackingLock(path=lock_path).holder_alive() is False
+
+
+def test_holder_alive_does_not_modify_lock_file(lock_path):
+    """只读查询不能顺手把锁删掉，否则会把正在跑的采集进程放进来。"""
+    lock = TrackingLock(path=lock_path)
+    lock.acquire()
+    before = lock_path.read_text(encoding="utf-8")
+    lock.holder_alive()
+    assert lock_path.exists()
+    assert lock_path.read_text(encoding="utf-8") == before
