@@ -9,6 +9,7 @@ from datetime import datetime
 from pathlib import Path
 
 from .browser import resolve_site
+from .config import MIN_POLL_INTERVAL
 from .games import is_game
 from .overrides import override_for
 
@@ -180,11 +181,13 @@ def run_tracking(db, cfg: dict, stop_event=None) -> None:
 
     长会话每隔 checkpoint_seconds 落盘一段，进程被强杀时最多丢一段间隔内的时长。
     """
-    interval = float(cfg.get("poll_interval_seconds", 1.0))
-    min_session = float(cfg.get("min_session_seconds", 3))
+    # 下限保护：本函数也可能被直接调用，此时 cfg 未必经过 config.normalize_config
+    interval = max(MIN_POLL_INTERVAL, float(cfg.get("poll_interval_seconds", 1.0) or 1.0))
+    min_session = max(0.0, float(cfg.get("min_session_seconds", 3) or 0))
     # 超过该时长仍未切换窗口就先落库一段，避免崩溃/强杀丢掉整段会话
-    checkpoint_seconds = float(cfg.get("checkpoint_seconds", 45.0))
-    exclude = set(cfg.get("exclude_processes", []) or [])
+    checkpoint_seconds = float(cfg.get("checkpoint_seconds", 45.0) or 45.0)
+    # 进程名统一小写比较：Windows 返回 chrome.exe，而用户习惯按 Chrome.exe 配置
+    exclude = {str(name).strip().lower() for name in (cfg.get("exclude_processes") or [])}
     browser_site = bool(cfg.get("browser_site_tracking", True))
 
     current = None
@@ -204,7 +207,7 @@ def run_tracking(db, cfg: dict, stop_event=None) -> None:
                 info["site"] = ""
                 info["url"] = ""
 
-            if info is None or info["process"] in exclude:
+            if info is None or (info["process"] or "").strip().lower() in exclude:
                 _close_session(db, current, now, min_session)
                 current = None
                 last_checkpoint = None
@@ -232,7 +235,13 @@ def run_tracking(db, cfg: dict, stop_event=None) -> None:
                         "start": now,
                     }
                     last_checkpoint = now
-            time.sleep(interval)
+            # 用 stop_event.wait 代替 sleep：收到停止信号时立即退出，
+            # 不必再等满一个采样间隔（间隔设成 10 秒时差异很明显）
+            if stop_event is not None:
+                if stop_event.wait(interval):
+                    break
+            else:
+                time.sleep(interval)
     except KeyboardInterrupt:
         print("\n正在保存最后一段会话并退出...")
     finally:
