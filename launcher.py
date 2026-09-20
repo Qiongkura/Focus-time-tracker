@@ -26,18 +26,27 @@ def main():
 
     if len(sys.argv) > 1 and sys.argv[1] == "start":
         # 纯后台采集（exe 被 GUI 内部拉起的子进程模式）
-        from main import _TrackingLock
+        from tracker.lock import LockError, TrackingLock
         from tracker.monitor import run_tracking
 
-        lock = _TrackingLock(cfg)
-        if not lock.acquire():
+        lock = TrackingLock(cfg)
+        try:
+            acquired = lock.acquire()
+        except LockError as exc:
+            # fail-closed：锁不可用时宁可拒绝启动，也不要冒重复统计的风险
+            print(f"采集锁不可用，本次启动已取消：{exc}")
+            return
+        if not acquired:
             print("已有采集会话在运行，本次启动已取消。")
             return
         try:
             with UsageDB(db_path) as db:
                 run_tracking(db, cfg)
         finally:
-            lock.release()
+            try:
+                lock.release()
+            except LockError as exc:
+                print(f"释放采集锁失败：{exc}")
         return
 
     # 默认：打开可视化界面（界面会自动拉起自身带 start 的后台采集子进程）

@@ -12,11 +12,11 @@
 from __future__ import annotations
 
 import argparse
-import os
 from datetime import datetime
 
 from tracker.config import load_config, project_root
 from tracker.db import UsageDB
+from tracker.lock import LockError, TrackingLock
 from tracker.monitor import get_foreground_info, run_tracking
 from tracker.utils import fmt_hms
 
@@ -31,85 +31,39 @@ def _setup_paths():
     return root, cfg, data_dir / "usage.db", report_dir
 
 
-class _TrackingLock:
-    """跨进程采集互斥锁（data/tracking.lock + PID 存活检查）。
+def _acquire_or_explain(lock: TrackingLock) -> bool:
+    """获取采集锁；拿不到或被锁失败时打印原因并返回 False（fail-closed）。"""
+    try:
+        acquired = lock.acquire()
+    except LockError as exc:
+        print(f"【错误】采集锁不可用，为避免重复统计已取消启动：{exc}")
+        print("        确认没有其他采集进程后，可执行 python main.py unlock 手动恢复。")
+        return False
+    if not acquired:
+        print("【警告】已有采集会话在运行（可能是 dashboard 或其他 start）。"
+              "为避免重复统计，本次启动已取消。")
+        return False
+    return True
 
-    start 与 dashboard 共用同一把锁，保证同一时间只有一个 run_tracking
-    采集线程在写入数据库，避免时长重复统计。
-    """
 
-    def __init__(self, cfg: dict):
-        data_dir = project_root() / cfg.get("data_dir", "data")
-        self.path = data_dir / "tracking.lock"
-
-    @staticmethod
-    def _process_alive_and_age(pid: int):
-        """返回 (是否存活, 进程创建时间[微秒,1601纪元])；异常时保守返回 (True, 0)。"""
-        try:
-            import ctypes
-            from ctypes import wintypes
-            handle = ctypes.windll.kernel32.OpenProcess(0x1000, False, int(pid))
-            if not handle:
-                return False, 0
-            try:
-                ct = wintypes.FILETIME()
-                et = wintypes.FILETIME()
-                kt = wintypes.FILETIME()
-                ut = wintypes.FILETIME()
-                if ctypes.windll.kernel32.GetProcessTimes(
-                        handle, ctypes.byref(ct), ctypes.byref(et),
-                        ctypes.byref(kt), ctypes.byref(ut)):
-                    created = (ct.dwHighDateTime << 32) | ct.dwLowDateTime
-                    return True, created
-                return True, 0
-            finally:
-                ctypes.windll.kernel32.CloseHandle(handle)
-        except Exception:
-            return True, 0
-
-    def acquire(self) -> bool:
-        try:
-            if self.path.exists():
-                content = self.path.read_text(encoding="utf-8").strip()
-                pid_s, _, created_s = content.partition("|")
-                if pid_s.isdigit():
-                    alive, created = self._process_alive_and_age(int(pid_s))
-                    same_created = created_s.isdigit() and created == int(created_s)
-                    # 新格式校验进程创建时间，防止 PID 被复用导致误判
-                    if alive and (created_s == "" or same_created):
-                        return False
-                self.path.unlink(missing_ok=True)
-            _alive, created = self._process_alive_and_age(os.getpid())
-            self.path.write_text(f"{os.getpid()}|{created}", encoding="utf-8")
-            return True
-        except Exception:
-            return True
-
-    def release(self) -> None:
-        try:
-            if self.path.exists():
-                content = self.path.read_text(encoding="utf-8").strip()
-                pid_s, _, created_s = content.partition("|")
-                if pid_s == str(os.getpid()):
-                    _alive, created = self._process_alive_and_age(os.getpid())
-                    if created_s == "" or (created_s.isdigit() and created == int(created_s)):
-                        self.path.unlink(missing_ok=True)
-        except Exception:
-            pass
+def _release_or_warn(lock: TrackingLock) -> None:
+    try:
+        lock.release()
+    except LockError as exc:
+        print(f"【警告】释放采集锁失败：{exc}")
 
 
 def cmd_start(args):
     """纯后台采集：不启动 GUI，与 dashboard 互斥（同一把锁）。"""
     _, cfg, db_path, _ = _setup_paths()
-    lock = _TrackingLock(cfg)
-    if not lock.acquire():
-        print("【警告】已有采集会话在运行（可能是 dashboard 或其他 start）。为避免重复统计，本次启动已取消。")
+    lock = TrackingLock(cfg)
+    if not _acquire_or_explain(lock):
         return
     try:
         with UsageDB(db_path) as db:
             run_tracking(db, cfg)
     finally:
-        lock.release()
+        _release_or_warn(lock)
 
 
 def cmd_now(args):
@@ -173,9 +127,13 @@ def cmd_dashboard(args):
 def cmd_unlock(args):
     """强制清除采集锁文件（进程已确认退出、但锁残留时使用）。"""
     _, cfg, _, _ = _setup_paths()
-    lock = _TrackingLock(cfg)
-    if lock.path.exists():
-        lock.path.unlink(missing_ok=True)
+    lock = TrackingLock(cfg)
+    try:
+        existed = lock.force_unlock()
+    except LockError as exc:
+        print(f"【错误】清除锁文件失败：{exc}")
+        return
+    if existed:
         print("已清除采集锁文件。若确实还有采集进程在运行，请先关闭它，否则会重复统计。")
     else:
         print("当前没有锁文件，无需解锁。")
