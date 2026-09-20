@@ -43,7 +43,22 @@
 - **存储层**（`tracker/db.py`）：SQLite WAL 模式，支持 GUI 并发读取和后台写入；按天自动拆分跨午夜会话；`metadata` 表记录 schema 版本，分类回填只在版本升级或规则文件变化时执行
 - **互斥采集**（`tracker/lock.py`）：`os.open(O_CREAT | O_EXCL)` 原子抢锁，锁操作失败时 fail-closed（拒绝启动而不是放行），并校验进程创建时间以防 PID 复用误判
 - **隐私与保留**（`tracker/privacy.py`）：URL 落库策略（剥离 query/fragment、可选只存域名）与历史保留天数清理
-- **GUI 层**（`tracker/app.py`）：五个页面（首页/统计/详细记录/分类/设置），浅色主题，圆角控件，左侧导航栏；前台窗口预览由后台线程采样，主线程只读结果，不阻塞界面
+- **GUI 层**（`tracker/app.py` + `tracker/ui/`）：五个页面（首页/统计/详细记录/分类/设置），浅色主题，圆角控件，左侧导航栏。`app.py` 只做组装入口，页面与基础设施按职责拆在 `tracker/ui/` 下：
+
+  | 模块 | 职责 |
+  | --- | --- |
+  | `app_shell.py` | 窗口骨架：DPI、样式、侧边栏、页面容器、日志轮转、生命周期 |
+  | `home_page.py` | 首页概览卡片与时段切换 |
+  | `stats_page.py` | 统计页（matplotlib 懒加载，自定义圆角柱） |
+  | `records_page.py` | 详细记录页（按小时合并 + 分批流式渲染） |
+  | `categories_page.py` | 分类页（三栏布局 + 进程改判） |
+  | `settings_page.py` | 设置页（采样参数 / 排除进程 / 数据文件） |
+  | `refresh_controller.py` | 刷新调度与跨 0 点提示 |
+  | `background.py` | 后台采集子进程、系统托盘、启动期自检 |
+  | `preview.py` | 前台窗口预览采样线程 |
+  | `common.py` | 跨页面共用的纯展示函数 |
+
+  各页面以 mixin 形式由 `ScreenTimeApp` 多继承组装，彼此只通过 `self` 交换状态，因此拆分不改变任何对外调用点。
 - **系统托盘**（`tracker/tray.py`）：最小化到托盘继续记录，支持恢复主界面和退出
 
 ## 📦 环境依赖
@@ -152,7 +167,7 @@ python main.py demo
 ## 🧪 测试
 
 自动化测试（游戏规则、站点清洗、DB 聚合、浏览器缓存、采集锁原子性、采集组件切段、
-配置校验、URL 隐私策略等，共 104 例）：
+配置校验、URL 隐私策略、GUI 页面 mixin 契约等，共 180 例）：
 
 ```bash
 python -m pip install -r requirements-dev.txt
@@ -162,6 +177,11 @@ python -m pytest
 Windows CI（`.github/workflows/ci.yml`）会在 Python 3.10 / 3.12 上跑 `compileall`
 语法检查与全部单测。注意 `tracker/monitor.py` 依赖 Win32 API，在非 Windows 平台
 导入时即抛错，所以 CI 必须使用 `windows-latest`。
+
+`tests/test_ui_modules.py` 里有一项静态名字解析检查：它扫描 `tracker/ui/` 下每个
+方法体（含注解），确认引用的名字都能在模块顶层或函数作用域里找到。拆 GUI 时最容易
+犯的错误是「搬过来的代码调用了没导入的名字」——这类问题只在对应页面真的被构建时才
+抛 `NameError`，单测通常不建 Tk 窗口，所以会静默通过。
 
 手动验证：
 - 执行 `python main.py demo` 生成示例数据，打开 GUI 检查各页面显示
