@@ -29,6 +29,10 @@ DEFAULTS = {
     "browser_site_tracking": True,  # 识别浏览器当前访问的具体网站
     "data_dir": "data",             # SQLite 数据目录
     "report_dir": "reports",        # 图表输出目录
+    # ---- 隐私与数据保留 ----
+    "retention_days": 0,            # 历史保留天数，0 = 永久保留
+    "store_full_url": True,         # False 时 URL 只保存「协议://域名」
+    "strip_url_query": True,        # 保存 URL 时去掉 ?query 与 #fragment
 }
 
 # 采样间隔下限：低于此值会让采集线程变成高频轮询，白烧 CPU
@@ -149,15 +153,30 @@ def normalize_config(raw) -> tuple[dict, list[str]]:
         cfg["checkpoint_seconds"] = cfg["min_session_seconds"]
 
     # ---- 布尔项 ----
-    if "browser_site_tracking" in raw:
-        value, ok = _as_bool(raw["browser_site_tracking"],
-                             DEFAULTS["browser_site_tracking"])
+    for key in ("browser_site_tracking", "store_full_url", "strip_url_query"):
+        if key not in raw:
+            continue
+        value, ok = _as_bool(raw[key], DEFAULTS[key])
         if not ok:
             problems.append(
-                f"browser_site_tracking={raw['browser_site_tracking']!r} 不是布尔值，"
-                f"已回退默认值 {DEFAULTS['browser_site_tracking']}"
+                f"{key}={raw[key]!r} 不是布尔值，已回退默认值 {DEFAULTS[key]}"
             )
-        cfg["browser_site_tracking"] = value
+        cfg[key] = value
+
+    # ---- 历史保留天数（非负整数，0 = 永久保留） ----
+    if "retention_days" in raw:
+        value, ok = _as_float(raw["retention_days"], 0.0)
+        if not ok:
+            problems.append(
+                f"retention_days={raw['retention_days']!r} 不是有效数字，"
+                f"已回退 0（永久保留）"
+            )
+            cfg["retention_days"] = 0
+        else:
+            days = max(0, int(value))
+            if days != value:
+                problems.append(f"retention_days={value:g} 已取整为 {days} 天")
+            cfg["retention_days"] = days
 
     # ---- 进程排除列表 ----
     if "exclude_processes" in raw:

@@ -7,6 +7,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 
 from .config import project_root
+from .privacy import UrlPolicy
 from .utils import clean_site_text, normalize_site_key
 
 # schema 版本：改动 sessions 结构或分类回填逻辑时 +1。
@@ -63,9 +64,11 @@ def _split_by_day(start: datetime, end: datetime):
 
 
 class UsageDB:
-    def __init__(self, db_path: Path):
+    def __init__(self, db_path: Path, url_policy: UrlPolicy | None = None):
         self.db_path = Path(db_path)
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
+        # URL 落库策略：默认去掉 query/fragment，避免搜索词与临时 token 落盘
+        self.url_policy = url_policy or UrlPolicy()
         # check_same_thread=False：监控线程写、GUI 线程读
         self.conn = sqlite3.connect(str(self.db_path), check_same_thread=False)
         self.conn.execute("PRAGMA journal_mode=WAL")
@@ -231,6 +234,8 @@ class UsageDB:
 
     def add_session(self, start: datetime, end: datetime, process: str, exe_path: str = "",
                     title: str = "", category: str = "应用", site: str = "", url: str = "") -> None:
+        # URL 按策略清洗后再落库（默认剥离 query 与 fragment）
+        url = self.url_policy.apply(url)
         with self._lock:
             for s, e in _split_by_day(start, end):
                 duration = (e - s).total_seconds()

@@ -14,11 +14,13 @@ from __future__ import annotations
 
 import argparse
 from datetime import datetime, timedelta
+from pathlib import Path
 
 from tracker.config import load_config, project_root
 from tracker.db import UsageDB
 from tracker.lock import LockError, TrackingLock
 from tracker.monitor import get_foreground_info, run_tracking
+from tracker.privacy import UrlPolicy, apply_retention
 from tracker.utils import fmt_hms
 
 
@@ -30,6 +32,11 @@ def _setup_paths():
     data_dir.mkdir(parents=True, exist_ok=True)
     report_dir.mkdir(parents=True, exist_ok=True)
     return root, cfg, data_dir / "usage.db", report_dir
+
+
+def _open_db(db_path: Path, cfg: dict) -> UsageDB:
+    """按配置打开数据库：URL 落库策略来自 config（见 tracker/privacy.py）。"""
+    return UsageDB(db_path, url_policy=UrlPolicy.from_config(cfg))
 
 
 def _acquire_or_explain(lock: TrackingLock) -> bool:
@@ -61,7 +68,10 @@ def cmd_start(args):
     if not _acquire_or_explain(lock):
         return
     try:
-        with UsageDB(db_path) as db:
+        with _open_db(db_path, cfg) as db:
+            removed = apply_retention(db, cfg.get("retention_days", 0))
+            if removed:
+                print(f"已按保留策略（{cfg['retention_days']} 天）清理 {removed} 条历史记录")
             run_tracking(db, cfg)
     finally:
         _release_or_warn(lock)
@@ -79,8 +89,8 @@ def cmd_now(args):
 
 
 def cmd_stats(args):
-    _, _, db_path, _ = _setup_paths()
-    with UsageDB(db_path) as db:
+    _, cfg, db_path, _ = _setup_paths()
+    with _open_db(db_path, cfg) as db:
         now = datetime.now()
         start = now.replace(hour=0, minute=0, second=0, microsecond=0)
         data = db.summary_between(start, now)
@@ -102,8 +112,8 @@ def cmd_report(args):
     matplotlib.use("Agg")
     from tracker.report import generate_today_chart, generate_week_chart
 
-    _, _, db_path, report_dir = _setup_paths()
-    with UsageDB(db_path) as db:
+    _, cfg, db_path, report_dir = _setup_paths()
+    with _open_db(db_path, cfg) as db:
         if args.days <= 1:
             path = report_dir / f"今日使用_{datetime.now():%Y%m%d}.png"
             generate_today_chart(db, path)
@@ -121,7 +131,7 @@ def cmd_dashboard(args):
     from tracker.app import run_app
 
     _, cfg, db_path, report_dir = _setup_paths()
-    with UsageDB(db_path) as db:
+    with _open_db(db_path, cfg) as db:
         run_app(db, cfg, report_dir)
 
 
@@ -158,7 +168,7 @@ def cmd_game(args):
 
 
 def cmd_doctor(args):
-    """自检：残留采集锁、时间重叠记录、数据库体积。
+    """自检：残留采集锁、时间重叠记录、数据库体积与保留策略。
 
     重叠检查原本挂在 GUI 启动路径上做全表自连接，数据量一大就会拖慢
     启动；现在改为按需执行的独立命令，并默认只看最近若干天。
@@ -187,10 +197,16 @@ def cmd_doctor(args):
         return
 
     size_mb = db_path.stat().st_size / 1024 / 1024
-    with UsageDB(db_path) as db:
+    with _open_db(db_path, cfg) as db:
         print(f"[库]   {db_path}")
         print(f"       记录数 {db.count_sessions()}    体积 {size_mb:.2f} MB    "
               f"schema v{db.schema_version()}")
+
+        retention = cfg.get("retention_days", 0)
+        policy = db.url_policy
+        print(f"[隐私] 保留策略 {retention or '永久'}    "
+              f"完整 URL {'保留' if policy.store_full_url else '只存域名'}    "
+              f"query {'已剥离' if policy.strip_query else '保留'}")
 
         since = datetime.now() - timedelta(days=args.days)
         pairs = db.find_overlapping_sessions(since=since, limit=args.limit)
@@ -210,8 +226,8 @@ def cmd_doctor(args):
 def cmd_demo(args):
     from tracker.demo import seed_demo_data
 
-    _, _, db_path, _ = _setup_paths()
-    with UsageDB(db_path) as db:
+    _, cfg, db_path, _ = _setup_paths()
+    with _open_db(db_path, cfg) as db:
         seed_demo_data(db, days=7)
 
 

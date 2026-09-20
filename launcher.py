@@ -9,6 +9,7 @@ import sys
 
 from tracker.config import load_config, project_root
 from tracker.db import UsageDB
+from tracker.privacy import UrlPolicy, apply_retention
 
 
 def _setup_paths():
@@ -19,6 +20,11 @@ def _setup_paths():
     data_dir.mkdir(parents=True, exist_ok=True)
     report_dir.mkdir(parents=True, exist_ok=True)
     return cfg, data_dir / "usage.db", report_dir
+
+
+def _open_db(db_path, cfg) -> UsageDB:
+    """按配置打开数据库：URL 落库策略来自 config（见 tracker/privacy.py）。"""
+    return UsageDB(db_path, url_policy=UrlPolicy.from_config(cfg))
 
 
 def main():
@@ -40,7 +46,11 @@ def main():
             print("已有采集会话在运行，本次启动已取消。")
             return
         try:
-            with UsageDB(db_path) as db:
+            with _open_db(db_path, cfg) as db:
+                removed = apply_retention(db, cfg.get("retention_days", 0))
+                if removed:
+                    print(f"已按保留策略（{cfg.get('retention_days')} 天）"
+                          f"清理 {removed} 条历史记录")
                 run_tracking(db, cfg)
         finally:
             try:
@@ -54,7 +64,7 @@ def main():
     matplotlib.use("TkAgg")
     from tracker.app import run_app
 
-    with UsageDB(db_path) as db:
+    with _open_db(db_path, cfg) as db:
         run_app(db, cfg, report_dir)
 
 
