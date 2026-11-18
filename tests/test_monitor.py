@@ -3,8 +3,8 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta
 
-from tracker.browser import SiteInfo
 from tracker import monitor as mon
+from tracker.browser import SiteInfo
 from tracker.monitor import _session_key, _write_segment, classify_window
 
 

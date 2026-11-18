@@ -6,7 +6,6 @@ from datetime import datetime, timedelta
 from tracker.db import UsageDB
 from tracker.privacy import UrlPolicy, apply_retention
 
-
 # ---------- UrlPolicy ----------
 
 def test_query_is_stripped_by_default():

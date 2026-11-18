@@ -21,7 +21,9 @@ from tracker import theme
 tk = pytest.importorskip("tkinter", reason="需要 tkinter")
 
 from tracker.widgets import (  # noqa: E402
-    ScrollArea, _ALL_SCROLL_AREAS, force_all_content_resize,
+    _ALL_SCROLL_AREAS,
+    ScrollArea,
+    force_all_content_resize,
 )
 
 _ROOT_ATTEMPTS = 2

@@ -7,7 +7,10 @@ from datetime import datetime, timedelta
 
 from tracker.db import UsageDB
 from tracker.monitor import (
-    SessionAccumulator, SessionWriter, TrackingService, WindowSampler,
+    SessionAccumulator,
+    SessionWriter,
+    TrackingService,
+    WindowSampler,
 )
 
 BASE = datetime(2026, 1, 1, 10, 0, 0)
@@ -169,7 +172,7 @@ def test_checkpoint_segments_do_not_overlap_or_lose_time():
     _flush(acc, writer, 36)
 
     assert len(db.rows) >= 3
-    for previous, following in zip(db.rows, db.rows[1:]):
+    for previous, following in zip(db.rows, db.rows[1:], strict=False):
         assert previous["end"] <= following["start"], "checkpoint 段出现重叠"
     assert db.rows[0]["start"] == _t(0)
     assert db.rows[-1]["end"] == _t(36)

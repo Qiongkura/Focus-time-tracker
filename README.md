@@ -86,8 +86,9 @@ python -m pip install pillow        # 建议安装，用于图标 / Logo
 
 | 命令 | 说明 |
 | --- | --- |
-| `python main.py dashboard` | 打开可视化界面（自动开始后台采集） |
+| `python main.py dashboard [--minimized]` | 打开可视化界面（自动管理后台采集，支持静默驻留托盘与单实例唤醒） |
 | `python main.py start` | 后台采集（前台循环，Ctrl+C 停止） |
+| `python main.py stop` | 通知正在运行的后台采集进程刷盘保存并优雅退出 |
 | `python main.py stats` | 控制台打印今日统计 |
 | `python main.py report` | 生成今日报告 PNG |
 | `python main.py report --days N` | 生成近 N 天趋势图 |
@@ -95,10 +96,10 @@ python -m pip install pillow        # 建议安装，用于图标 / Logo
 | `python main.py game rules` | 打印当前生效的游戏识别规则 |
 | `python main.py game check --path "C:\Riot Games\VALORANT\live\VALORANT.exe" --process VALORANT.exe` | 按规则判断某个进程/路径是否为游戏 |
 | `python main.py doctor` | 自检：残留锁 / 重叠记录 / 数据库体积 / 隐私策略 |
-| `python main.py unlock` | 清除残留采集锁 |
+| `python main.py unlock` | 强制清除残留采集锁 |
 | `python main.py backup [--out 路径]` | 备份数据库（含 WAL 中的最新数据） |
-| `python main.py restore 备份文件 --force` | 从备份恢复数据库（覆盖当前数据） |
-| `python main.py demo` | 生成 7 天示例数据，便于预览 |
+| `python main.py restore 备份文件 --force` | 从备份恢复数据库（采集运行中自动拦截保护） |
+| `python main.py demo [--db data/demo.db]` | 生成 7 天示例数据（真实库非空时默认拦截，防止污染数据） |
 
 ## 📝 使用示例
 
@@ -134,6 +135,7 @@ python main.py demo
 | `poll_interval_seconds` | 采样间隔（秒），调小更精确、调大更省资源；低于 `0.2` 会被自动提到 `0.2` | `1.0` |
 | `min_session_seconds` | 短于该时长的窗口切换不记录，避免碎片数据 | `3` |
 | `checkpoint_seconds` | 长会话每隔该秒数落盘一段，进程被强杀/断电时最多丢这一段 | `45` |
+| `idle_timeout_seconds` | 键鼠无操作超过该秒数自动暂停计时，`0` 表示不启用 | `0` |
 | `exclude_processes` | 不想统计的进程名列表，如 `["explorer.exe"]`；**大小写不敏感** | `[]` |
 | `browser_site_tracking` | 是否识别浏览器正在访问的具体网站；关闭后浏览器按普通应用统计 | `true` |
 | `data_dir` | 数据目录（相对项目根目录，也可写绝对路径） | `"data"` |
@@ -158,7 +160,7 @@ python main.py demo
 | `exclude_path_keywords` | 排除路径关键字，防止误伤普通软件 | `netease`、`cloudmusic` |
 | `exclude_process_exact` | 排除进程名精确匹配 | `weixin.exe`、`qq.exe` |
 
-规则默认**向内置列表追加**并自动去重；若想彻底替换内置列表，把 `replace_defaults` 改为 `true`。改完 `game_rules.json` 后重启采集进程生效。
+规则默认**向内置列表追加**并自动去重；若想彻底替换内置列表，把 `replace_defaults` 改为 `true`。改完 `game_rules.json` 后会自动检测时间戳热重载生效，无需重启采集进程。
 
 ### category_overrides.json
 

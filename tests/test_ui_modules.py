@@ -15,8 +15,8 @@ from pathlib import Path
 
 import pytest
 
-from tracker.app import ScreenTimeApp
 from tracker import ui
+from tracker.app import ScreenTimeApp
 
 TRACKER_DIR = Path(__file__).resolve().parent.parent / "tracker"
 UI_DIR = TRACKER_DIR / "ui"

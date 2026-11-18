@@ -14,8 +14,8 @@ import os
 
 import pytest
 
-from tracker.app import ScreenTimeApp
 from tracker import lock as lock_module
+from tracker.app import ScreenTimeApp
 from tracker.lock import process_created_time
 from tracker.ui import BackgroundMixin, SettingsPageMixin
 from tracker.ui import background as bg_module
