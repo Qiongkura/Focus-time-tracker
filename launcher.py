@@ -2,6 +2,7 @@
 
 带 start 参数时作为纯后台采集进程运行（由 GUI 内部自动拉起），两者通过
 tracking.lock 互斥，保证同时只有一个采集进程写库。
+支持 --minimized 参数开机静默驻留系统托盘。
 """
 from __future__ import annotations
 
@@ -29,8 +30,9 @@ def _open_db(db_path, cfg) -> UsageDB:
 
 def main():
     cfg, db_path, report_dir = _setup_paths()
+    args = sys.argv[1:]
 
-    if len(sys.argv) > 1 and sys.argv[1] == "start":
+    if args and args[0] == "start":
         # 纯后台采集（exe 被 GUI 内部拉起的子进程模式）
         from tracker.lock import LockError, TrackingLock
         from tracker.monitor import run_tracking
@@ -51,7 +53,7 @@ def main():
                 if removed:
                     print(f"已按保留策略（{cfg.get('retention_days')} 天）"
                           f"清理 {removed} 条历史记录")
-                run_tracking(db, cfg)
+                run_tracking(db, cfg, stop_check=lock.stop_requested)
         finally:
             try:
                 lock.release()
@@ -60,12 +62,13 @@ def main():
         return
 
     # 默认：打开可视化界面（界面会自动拉起自身带 start 的后台采集子进程）
+    start_minimized = "--minimized" in args
     import matplotlib
     matplotlib.use("TkAgg")
     from tracker.app import run_app
 
     with _open_db(db_path, cfg) as db:
-        run_app(db, cfg, report_dir)
+        run_app(db, cfg, report_dir, start_minimized=start_minimized)
 
 
 if __name__ == "__main__":

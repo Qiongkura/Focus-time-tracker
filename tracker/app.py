@@ -12,7 +12,7 @@ mixin 之间只通过 ``self`` 交换状态，所以拆分没有改动任何外�
 ``stats_page``   统计页（matplotlib 图表）
 ``records_page`` 详细记录页（按小时合并 + 分批渲染）
 ``categories_page`` 分类页（三栏 + 进程改判）
-``settings_page``   设置页（采样参数 / 排除进程 / 数据文件）
+``settings_page``   设置页（采样参数 / 排除进程 / 隐私与数据维护）
 ``refresh_controller`` 刷新调度与跨 0 点提示
 ``background``   后台采集子进程、托盘、启动期自检
 ``preview``      前台窗口预览采样线程
@@ -24,12 +24,19 @@ import ctypes
 import tkinter as tk
 from pathlib import Path
 
-from . import theme
+from . import theme, tray
 from .db import UsageDB
 from .ui import (
-    BackgroundMixin, CategoriesPageMixin, HomePageMixin, RecordsPageMixin,
-    RefreshMixin, SettingsPageMixin, ShellMixin, StatsPageMixin,
+    BackgroundMixin,
+    CategoriesPageMixin,
+    HomePageMixin,
+    RecordsPageMixin,
+    RefreshMixin,
+    SettingsPageMixin,
+    ShellMixin,
+    StatsPageMixin,
 )
+
 # 重新导出：main.py 与测试仍按 ``from tracker.app import ...`` 取这两个名字
 from .ui.app_shell import rotate_log  # noqa: F401
 from .ui.preview import ForegroundPreviewWorker  # noqa: F401
@@ -69,7 +76,8 @@ class ScreenTimeApp(
 ):
     """主窗口：组装各 mixin，并持有它们共享的状态。"""
 
-    def __init__(self, db: UsageDB, cfg: dict, report_dir: Path):
+    def __init__(self, db: UsageDB, cfg: dict, report_dir: Path,
+                 *, start_minimized: bool = False):
         self.db = db
         self.cfg = dict(cfg)
         self.report_dir = Path(report_dir)
@@ -92,10 +100,16 @@ class ScreenTimeApp(
         self._refresh_timer = None  # 2 秒定时刷新循环
         self._boot_refresh_timer = None  # 启动后首次刷新
         self._boot_warm_timer = None  # 启动后统计图预热
+        self._hourly_timer = None  # 整点统计图刷新
+        self._stats_redraw_timer = None  # 统计图防抖重绘
+        self._records_chunk_timer = None  # 记录页分批流式构建定时器
         self._dialog_timer = None  # 延迟弹出的提示框（关窗时要能取消）
         self._closing = False  # 关窗流程已开始：所有定时回调直接返回
+        self._hidden_to_tray = False  # 隐藏到系统托盘期间暂停定时刷新与预览采样
         self._last_refresh_date = None  # 跨 0 点检测：上次刷新时的日期
         self._card_total_labels = {}
+        self._period_btn_groups = []  # 跨页面同步的「今日/本周」切换按钮组
+        self._db_exe_cache = {}  # 历史进程名 -> 数据库中记录的 exe_path 缓存
         self._records_dirty = True
         self._stats_tick = 0
         self._minimized = False
@@ -103,8 +117,9 @@ class ScreenTimeApp(
         self._tray_enabled = False
         self._tray_icon_path = None
         self._bg_proc = None
-        # 前台窗口预览放后台线程：主线程刷新时不再直接读浏览器历史库
+        # 前台窗口预览放后台线程，默认休眠；切到设置页时再激活，平时零开销
         self._preview = ForegroundPreviewWorker()
+        self._preview.set_active(False)
         self._preview.start()
 
         self.root = tk.Tk()
@@ -123,19 +138,24 @@ class ScreenTimeApp(
         self._setup_styles()
         self._build_sidebar()
         self._build_pages()
-        self.show_page("home")
         self._setup_tray()
         self._spawn_background()
-        self._check_overlap_sessions()
-        # 延迟首次刷新，窗口先显示出来；两个启动定时器都留 id，关窗时要能取消
-        self._boot_refresh_timer = self.root.after(150, self._refresh_loop)
-        self._boot_warm_timer = self.root.after(500, self._warm_stats)  # 启动后先渲染一次统计图
+        self.show_page("home")
+        if start_minimized and self._tray_enabled:
+            self._hide_to_tray(silent=True)
+        else:
+            self._check_overlap_sessions()
+            # 延迟首次定时循环与统计预热，窗口先显示出来
+            self._boot_refresh_timer = self.root.after(150, self._refresh_loop)
+            self._boot_warm_timer = self.root.after(500, self._warm_stats)
         self._schedule_hourly_stats()
-        self._stats_redraw_timer = None
 
 
-def run_app(db: UsageDB, cfg: dict, report_dir: Path):
-    app = ScreenTimeApp(db, cfg, report_dir)
+def run_app(db: UsageDB, cfg: dict, report_dir: Path, *, start_minimized: bool = False):
+    # 单实例唤醒：若已有 GUI 常驻托盘，直接唤醒旧窗口并退出，避免多开窗口
+    if not start_minimized and tray.wake_existing_instance():
+        return
+    app = ScreenTimeApp(db, cfg, report_dir, start_minimized=start_minimized)
     try:
         app.run()
     finally:

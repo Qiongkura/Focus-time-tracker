@@ -15,7 +15,10 @@ from tkinter import messagebox, ttk
 from .. import theme, tray
 from ..config import project_root
 from ..widgets import (
-    NavButton, get_brand_logo, rounded_polygon, stop_all_scroll_area_timers,
+    NavButton,
+    get_brand_logo,
+    rounded_polygon,
+    stop_all_scroll_area_timers,
 )
 
 NAV_PAGES = [
@@ -54,7 +57,6 @@ def rotate_log(path: Path, max_bytes: int = 1_000_000, keep: int = 3) -> None:
         path.replace(path.with_name(f"{path.name}.1"))
     except OSError:
         pass
-
 
 
 class ShellMixin:
@@ -103,7 +105,6 @@ class ShellMixin:
                         font=theme.font(10), padding=(4, 5))
 
     def _build_sidebar(self):
-        k = theme.scale(1.0)
         self.sidebar = tk.Frame(self.root, bg=theme.SIDEBAR_BG,
                                 width=theme.scale(theme.SIDEBAR_WIDTH))
         self.sidebar.pack(side="left", fill="y")
@@ -186,17 +187,28 @@ class ShellMixin:
 
     def show_page(self, key: str):
         self.current_page = key
-        for k, page in self.pages.items():
+        for _k, page in self.pages.items():
             page.pack_forget()
         self.pages[key].pack(fill="both", expand=True)
         for nk, btn in self.nav_buttons.items():
             btn.set_selected(nk == key)
-        if key == "records":
+
+        # 前台窗口预览仅在设置页可见时运行，其余页面零采样开销
+        if hasattr(self, "_preview") and hasattr(self._preview, "set_active"):
+            self._preview.set_active(
+                key == "settings" and not getattr(self, "_hidden_to_tray", False)
+            )
+
+        if key == "stats":
+            self._schedule_stats_draw()
+        elif key == "records":
             self._records_dirty = True
             self._refresh_records()
-        elif key == "stats":
-            self._schedule_stats_draw()
-
+        else:
+            try:
+                self.refresh()
+            except Exception as exc:  # noqa: BLE001
+                self._log_error("show_page", exc)
 
     def _log_error(self, where: str, exc: Exception):
         """把界面异常写入 data/ui_errors.log，便于排查 pythonw 下的静默错误。
@@ -216,7 +228,6 @@ class ShellMixin:
             # 日志本身失败时静默，绝不能反过来影响界面
             pass
 
-
     # ---------- 生命周期 ----------
     def _on_close(self):
         """点右上角 × ：隐藏到系统托盘（后台采集不受影响）。"""
@@ -225,10 +236,24 @@ class ShellMixin:
         else:
             self.shutdown()
 
-    def _hide_to_tray(self):
+    def _hide_to_tray(self, *, silent: bool = False):
+        self._hidden_to_tray = True
+        if hasattr(self, "_preview") and hasattr(self._preview, "set_active"):
+            self._preview.set_active(False)
+        # 隐藏到托盘期间暂停 2 秒 UI 刷新循环，恢复窗口时再唤醒
+        for attr in ("_refresh_timer", "_boot_refresh_timer"):
+            tid = getattr(self, attr, None)
+            if tid:
+                try:
+                    self.root.after_cancel(tid)
+                except (tk.TclError, ValueError):
+                    pass
+                setattr(self, attr, None)
         self.root.withdraw()
         self.root.title("屏幕使用时间 · 后台记录中")
-        if not self._minimize_hint_shown:
+        if silent:
+            self._minimize_hint_shown = True
+        elif not self._minimize_hint_shown:
             self._minimize_hint_shown = True
             self._dialog_timer = self.root.after(600, lambda: messagebox.showinfo(
                 "后台记录中",
@@ -256,22 +281,18 @@ class ShellMixin:
                 tray.disable_tray()
             except Exception:  # noqa: BLE001
                 pass
+            self._tray_enabled = False
         try:
             self.root.destroy()
         except tk.TclError:
             pass
 
     def _cancel_timers(self):
-        """取消所有排队中的 after，然后才能安全 destroy。
-
-        ``root.destroy()`` 会把控件注册的 Tcl 命令一起删掉，但**不会**取消
-        已经排队的定时器。到点后 Tk 找不到回调命令，就往 stderr 刷
-        ``invalid command name "..." (after script)``；如果那时正好有个
-        refresh 在跑，还会顺着 `_log_error` 写进 data/ui_errors.log。
-        """
+        """取消所有排队中的 after，然后才能安全 destroy。"""
         for attr in ("_refresh_timer", "_boot_refresh_timer", "_boot_warm_timer",
                      "_hourly_timer", "_stats_redraw_timer", "_resize_timer",
-                     "_content_timer", "_banner_timer", "_dialog_timer"):
+                     "_content_timer", "_banner_timer", "_dialog_timer",
+                     "_records_chunk_timer"):
             tid = getattr(self, attr, None)
             if tid:
                 try:

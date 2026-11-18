@@ -13,20 +13,16 @@ from ..monitor import get_foreground_info
 class ForegroundPreviewWorker:
     """后台采样「当前前台窗口」，供设置页预览使用。
 
-    为什么需要它：``get_foreground_info()`` 内部会走到浏览器历史库查询——
-    枚举 Chrome/Edge/Firefox 的配置目录、打开 History / places.sqlite，
-    失败时还要把数据库整个复制到临时文件再查。即使已经有 3 秒查询节流和
-    0.2 秒 SQLite 超时，遇到浏览器独占数据库或磁盘繁忙时，单次调用仍可能
-    阻塞几百毫秒。这个调用原本发生在 Tk 主线程的刷新循环里（每 2 秒一次），
-    于是设置页甚至整个界面会跟着顿一下。
-
-    这里把采样整体挪到独立线程，主线程只读最近一次结果，不再碰 Win32
-    与浏览器历史库。
+    支持按需启停采样（``set_active``）：仅当用户停留在「设置」页且窗口可见时才激活，
+    平时与隐藏到托盘时完全休眠（零 CPU / 零历史库 I/O）。直接实例化时默认处于激活状态，
+    保持独立调用与原有单元测试行为不变。
     """
 
     def __init__(self, interval: float = 2.0):
         self._interval = max(0.5, float(interval))
         self._stop = threading.Event()
+        self._active = threading.Event()
+        self._active.set()
         self._thread: threading.Thread | None = None
         self._lock = threading.Lock()
         self._latest: dict | None = None
@@ -39,8 +35,16 @@ class ForegroundPreviewWorker:
             target=self._run, name="foreground-preview", daemon=True)
         self._thread.start()
 
+    def set_active(self, active: bool) -> None:
+        """切换采样激活状态：未激活时后台线程阻塞等待，不消耗资源。"""
+        if active:
+            self._active.set()
+        else:
+            self._active.clear()
+
     def stop(self) -> None:
         self._stop.set()
+        self._active.set()
 
     def latest(self) -> tuple[bool, dict | None]:
         """返回 ``(是否已产出过结果, 最近一次前台窗口信息)``。
@@ -52,6 +56,10 @@ class ForegroundPreviewWorker:
 
     def _run(self) -> None:
         while not self._stop.is_set():
+            if not self._active.wait(timeout=0.5):
+                continue
+            if self._stop.is_set():
+                break
             try:
                 info = get_foreground_info()
             except Exception:  # noqa: BLE001 - 预览失败绝不能影响界面

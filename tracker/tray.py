@@ -11,7 +11,8 @@ import ctypes
 import math
 import struct
 from ctypes import wintypes
-from pathlib import Path
+
+from .config import resource_path
 
 user32 = ctypes.windll.user32
 shell32 = ctypes.windll.shell32
@@ -111,6 +112,10 @@ user32.DestroyMenu.argtypes = [wintypes.HMENU]
 user32.DestroyWindow.argtypes = [wintypes.HWND]
 user32.DestroyIcon.argtypes = [wintypes.HICON]
 user32.UnregisterClassW.argtypes = [wintypes.LPCWSTR, wintypes.HINSTANCE]
+user32.FindWindowExW.argtypes = [
+    wintypes.HWND, wintypes.HWND, wintypes.LPCWSTR, wintypes.LPCWSTR,
+]
+user32.FindWindowExW.restype = wintypes.HWND
 
 _state = {
     "hwnd": None,
@@ -224,6 +229,19 @@ def disable_tray():
         _state.update(hwnd=None, wndproc=None, nid=None, hicon=None, hinst=None)
 
 
+def wake_existing_instance() -> bool:
+    """若已有 GUI 实例常驻系统托盘，向其托盘消息窗口发送恢复指令并返回 True。"""
+    try:
+        hwnd = user32.FindWindowExW(
+            wintypes.HWND(HWND_MESSAGE), None, _state["class_name"], None,
+        )
+        if not hwnd:
+            return False
+        return bool(user32.PostMessageW(hwnd, WM_TRAY, 1, WM_LBUTTONUP))
+    except Exception:
+        return False
+
+
 # ---------- 运行时生成托盘图标（.ico，蓝色圆角方块 + 白色时钟） ----------
 
 def _dist_to_segment(px, py, ax, ay, bx, by):
@@ -305,7 +323,7 @@ def _logo_pixels(size: int = 32):
     """从 assets/logo.png 读取图标像素矩阵（缺资源/出错返回 None）。"""
     try:
         from PIL import Image
-        path = Path(__file__).resolve().parent.parent / "assets" / "logo.png"
+        path = resource_path("assets", "logo.png")
         if not path.exists():
             return None
         img = Image.open(path).convert("RGBA").resize((size, size), Image.LANCZOS)

@@ -5,9 +5,9 @@ import os
 import time
 import tkinter as tk
 import weakref
-from pathlib import Path
 
 from . import theme
+from .config import resource_path
 
 try:  # Pillow（图标处理）
     from PIL import Image, ImageDraw, ImageTk
@@ -43,7 +43,7 @@ _EXE_CACHE_TS = 0.0
 _DEFAULT_ICON = None
 _GLOBE_ICON = None
 _ICON_ROOT = None
-_LOGO_PATH = Path(__file__).resolve().parent.parent / "assets" / "logo.png"
+_LOGO_PATH = resource_path("assets", "logo.png")
 _BRAND_LOGO_CACHE: dict = {}
 
 # 常见软件友好名称兜底（ProductName 缺失或与文件名相同时使用）
@@ -741,10 +741,11 @@ class ScrollArea(tk.Frame):
         self.inner.bind("<MouseWheel>", self._on_wheel)
         self.inner.bind("<Shift-MouseWheel>", self._on_shift_wheel)
         self.canvas.bind("<Shift-MouseWheel>", self._on_shift_wheel)
-        # 重新映射（切页/取消最小化）时解除节流：这一次布局要立刻生效
-        self.bind("<Map>", lambda _e: self._reset_content_throttle(), add="+")
+        # 重新映射（切页/取消最小化）时解除节流并同步一次滚动条，无需永久 400ms 空转轮询
+        self.bind("<Map>", lambda _e: (self._reset_content_throttle(), self._schedule_sync()),
+                  add="+")
         self._sync_timer = None
-        self._periodic_sync()
+        self.refresh_scroll()
         _ALL_SCROLL_AREAS.add(self)
 
     def _schedule_sync(self):
@@ -923,7 +924,7 @@ class ScrollArea(tk.Frame):
 
 
 # 所有滚动容器的弱引用集合：窗口缩放停手后统一做一次精确重排
-_ALL_SCROLL_AREAS: "weakref.WeakSet[ScrollArea]" = weakref.WeakSet()
+_ALL_SCROLL_AREAS: weakref.WeakSet[ScrollArea] = weakref.WeakSet()
 
 
 def force_all_content_resize():

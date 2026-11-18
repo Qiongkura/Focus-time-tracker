@@ -2,7 +2,8 @@
 
 用法:
   python main.py start              开始记录前台窗口使用时长（Ctrl+C 停止）
-  python main.py dashboard          打开实时可视化面板
+  python main.py stop               通知后台采集进程保存并优雅退出
+  python main.py dashboard          打开实时可视化面板（支持 --minimized）
   python main.py report             生成今日报告图片
   python main.py report --days 7    生成近 7 天趋势图
   python main.py stats              在控制台查看今日统计
@@ -63,7 +64,7 @@ def _release_or_warn(lock: TrackingLock) -> None:
 
 
 def cmd_start(args):
-    """纯后台采集：不启动 GUI，与 dashboard 互斥（同一把锁）。"""
+    """纯后台采集：不启动 GUI，与 dashboard 共用同一把采集锁。"""
     _, cfg, db_path, _ = _setup_paths()
     lock = TrackingLock(cfg)
     if not _acquire_or_explain(lock):
@@ -73,9 +74,31 @@ def cmd_start(args):
             removed = apply_retention(db, cfg.get("retention_days", 0))
             if removed:
                 print(f"已按保留策略（{cfg['retention_days']} 天）清理 {removed} 条历史记录")
-            run_tracking(db, cfg)
+            run_tracking(db, cfg, stop_check=lock.stop_requested)
     finally:
         _release_or_warn(lock)
+
+
+def cmd_stop(args):
+    """协作式停止正在运行的后台采集进程（自动刷盘最后一段会话并释放锁）。"""
+    _, cfg, _, _ = _setup_paths()
+    lock = TrackingLock(cfg)
+    try:
+        if not lock.holder_alive():
+            if lock.path.exists():
+                lock.force_unlock()
+                print("未发现存活的采集进程，已顺带清理残留锁文件。")
+            else:
+                print("当前没有正在运行的后台采集进程。")
+            return
+    except LockError as exc:
+        print(f"【错误】检查采集锁失败：{exc}")
+        return
+
+    if lock.request_stop(timeout=4.0):
+        print("后台采集进程已保存当前会话并安全退出。")
+    else:
+        print("【警告】等待后台采集退出超时，请稍后执行 python main.py doctor 检查状态。")
 
 
 def cmd_now(args):
@@ -125,15 +148,13 @@ def cmd_report(args):
 
 
 def cmd_dashboard(args):
-    # dashboard 内部自带窗口采集，与 start 互斥（tracking.lock 保证同一时间只有一个采集线程）
-    print("【注意】dashboard 内部自带窗口采集，请勿再在别的终端执行 python main.py start，否则会重复统计时长！")
     import matplotlib
     matplotlib.use("TkAgg")
     from tracker.app import run_app
 
     _, cfg, db_path, report_dir = _setup_paths()
     with _open_db(db_path, cfg) as db:
-        run_app(db, cfg, report_dir)
+        run_app(db, cfg, report_dir, start_minimized=bool(getattr(args, "minimized", False)))
 
 
 def cmd_unlock(args):
@@ -146,7 +167,7 @@ def cmd_unlock(args):
         print(f"【错误】清除锁文件失败：{exc}")
         return
     if existed:
-        print("已清除采集锁文件。若确实还有采集进程在运行，请先关闭它，否则会重复统计。")
+        print("已清除采集锁文件。若确实还有采集进程在运行，请先执行 python main.py stop。")
     else:
         print("当前没有锁文件，无需解锁。")
 
@@ -169,11 +190,7 @@ def cmd_game(args):
 
 
 def cmd_doctor(args):
-    """自检：残留采集锁、时间重叠记录、数据库体积与保留策略。
-
-    重叠检查原本挂在 GUI 启动路径上做全表自连接，数据量一大就会拖慢
-    启动；现在改为按需执行的独立命令，并默认只看最近若干天。
-    """
+    """自检：残留采集锁、时间重叠记录、数据库体积与保留策略。"""
     _, cfg, db_path, _ = _setup_paths()
     print("屏幕使用时间 · 自检")
     print("-" * 52)
@@ -185,11 +202,17 @@ def cmd_doctor(args):
             content = lock.path.read_text(encoding="utf-8").strip()
         except OSError as exc:
             content = f"（读取失败：{exc}）"
-        print(f"[锁]   发现锁文件 {lock.path}")
+        try:
+            alive = lock.holder_alive()
+        except LockError:
+            alive = False
+        state = "存活运行中" if alive else "残留锁（进程已退出）"
+        print(f"[锁]   发现锁文件 {lock.path}（{state}）")
         print(f"       内容：{content}")
-        print("       确认没有采集进程在运行后，可执行 python main.py unlock 清除")
+        if not alive:
+            print("       可执行 python main.py unlock 清除残留锁")
     else:
-        print("[锁]   无残留锁文件")
+        print("[锁]   无锁文件（当前未运行后台采集）")
 
     # 2) 数据库
     if not db_path.exists():
@@ -225,11 +248,7 @@ def cmd_doctor(args):
 
 
 def cmd_backup(args):
-    """把数据库备份到指定文件。
-
-    用 SQLite 的在线备份 API 而不是直接复制文件：WAL 模式下最近的记录可能
-    还留在 ``-wal`` 文件里，直接 copy 会丢数据。
-    """
+    """把数据库备份到指定文件（使用 SQLite 在线备份 API，包含 WAL 最新数据）。"""
     _, cfg, db_path, _ = _setup_paths()
     if not db_path.exists():
         print(f"数据库不存在，无需备份：{db_path}")
@@ -257,6 +276,16 @@ def cmd_restore(args):
         print(f"备份文件不存在：{source}")
         return
 
+    lock = TrackingLock(cfg)
+    try:
+        if lock.holder_alive():
+            print("【错误】检测到后台采集进程正在运行，直接覆盖数据库可能导致冲突或数据损坏。")
+            print("        请先执行 python main.py stop（或关闭界面）停止追踪后再恢复。")
+            return
+    except LockError as exc:
+        print(f"【错误】无法确认采集锁状态，已取消恢复：{exc}")
+        return
+
     if db_path.exists() and not args.force:
         print(f"目标数据库已存在：{db_path}")
         print("恢复会覆盖当前数据。确认后请加 --force 重试；"
@@ -277,7 +306,14 @@ def cmd_demo(args):
     from tracker.demo import seed_demo_data
 
     _, cfg, db_path, _ = _setup_paths()
-    with _open_db(db_path, cfg) as db:
+    target = Path(args.db) if getattr(args, "db", "") else db_path
+    with _open_db(target, cfg) as db:
+        if target == db_path and db.count_sessions() > 0 and not getattr(args, "force", False):
+            print(f"【保护】真实数据库已有 {db.count_sessions()} 条历史记录：{db_path}")
+            print("        为避免示例数据混入真实统计，本次未写入。")
+            print("        可指定独立文件：python main.py demo --db data/demo.db")
+            print("        或确认写入当前库：python main.py demo --force")
+            return
         seed_demo_data(db, days=7)
 
 
@@ -285,15 +321,18 @@ def main():
     parser = argparse.ArgumentParser(description="屏幕聚焦进程使用时长统计与可视化（仅 Windows）")
     sub = parser.add_subparsers(dest="command", required=True)
 
-    # start：纯后台采集，不启动 GUI；dashboard：GUI + 内部采集。二者互斥。
-    sub.add_parser("start", help="纯后台采集前台窗口使用时长（Ctrl+C 停止，与 dashboard 互斥）")
-    sub.add_parser("dashboard", help="打开可视化界面并自动开始追踪（与 start 互斥）")
+    sub.add_parser("start", help="纯后台采集前台窗口使用时长（Ctrl+C 停止）")
+    sub.add_parser("stop", help="通知后台采集进程刷盘保存并优雅退出")
+    p_dash = sub.add_parser("dashboard", help="打开可视化界面并自动管理后台采集")
+    p_dash.add_argument("--minimized", action="store_true", help="启动后直接静默隐藏到系统托盘")
     sub.add_parser("stats", help="在控制台查看今日统计")
-    sub.add_parser("unlock", help="清除残留的采集锁文件（卡在“已有采集会话”时使用）")
+    sub.add_parser("unlock", help="强制清除残留的采集锁文件")
     p_report = sub.add_parser("report", help="生成报告图片")
     p_report.add_argument("--days", type=int, default=1, help="统计天数，1=今日，7=近7天（默认 1）")
     sub.add_parser("now", help="查看当前前台窗口信息（诊断用）")
-    sub.add_parser("demo", help="生成 7 天示例数据，便于预览图表")
+    p_demo = sub.add_parser("demo", help="生成 7 天示例数据，便于预览图表")
+    p_demo.add_argument("--db", default="", help="写入指定的数据库路径（避免污染真实数据）")
+    p_demo.add_argument("--force", action="store_true", help="允许直接向已有记录的真实数据库追加示例数据")
     p_doctor = sub.add_parser("doctor", help="自检：残留锁 / 重叠记录 / 数据库体积")
     p_doctor.add_argument("--days", type=int, default=7, help="重叠检查回溯天数（默认 7）")
     p_doctor.add_argument("--limit", type=int, default=20, help="最多列出多少组重叠（默认 20）")
@@ -313,6 +352,7 @@ def main():
     args = parser.parse_args()
     handlers = {
         "start": cmd_start,
+        "stop": cmd_stop,
         "dashboard": cmd_dashboard,
         "stats": cmd_stats,
         "report": cmd_report,

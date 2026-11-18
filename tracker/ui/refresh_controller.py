@@ -13,9 +13,7 @@ from ..widgets import force_all_content_resize
 
 # 窗口缩放防抖：拖动过程中不做重活，停手后等这么久再跑一次布局收尾
 RESIZE_DEBOUNCE_MS = 90
-# 内容宽度「精确落位」的防抖。重排整块内容区是最贵的一步（首页约 85 个
-# 控件要重绘），所以比布局收尾更晚、且只在真正停手后才做；拖动过程中由
-# ScrollArea 自己的节流负责跟手。
+# 内容宽度「精确落位」的防抖
 RESIZE_CONTENT_SETTLE_MS = 280
 
 
@@ -25,7 +23,7 @@ class RefreshMixin:
     # ---------- 刷新循环 ----------
     def _refresh_loop(self):
         self._refresh_timer = None
-        if getattr(self, "_closing", False):
+        if getattr(self, "_closing", False) or getattr(self, "_hidden_to_tray", False):
             return
         try:
             if not self.root.winfo_exists():
@@ -38,6 +36,8 @@ class RefreshMixin:
             self.refresh()
         except Exception as exc:  # noqa: BLE001
             self._log_error("refresh_loop", exc)
+        if getattr(self, "_closing", False) or getattr(self, "_hidden_to_tray", False):
+            return
         try:
             self._refresh_timer = self.root.after(2000, self._refresh_loop)
         except tk.TclError:
@@ -45,11 +45,12 @@ class RefreshMixin:
 
     def _warm_stats(self):
         """启动后预渲染统计图，打开统计页时立即可见。"""
+        if getattr(self, "_closing", False) or getattr(self, "_hidden_to_tray", False):
+            return
         try:
             if self._stats_figs is None:
                 self._draw_stats()
         except Exception as exc:  # noqa: BLE001
-            # 界面容错不能变成「静默吞掉」：统一落日志，traceback 里有精确位置
             self._log_error("ui", exc)
 
     def _schedule_hourly_stats(self):
@@ -65,24 +66,18 @@ class RefreshMixin:
             pass
 
     def _on_hourly_stats(self):
+        if getattr(self, "_closing", False):
+            return
         try:
-            if self._stats_figs is not None:
+            if not getattr(self, "_hidden_to_tray", False) and self._stats_figs is not None:
                 self._draw_stats()
         except Exception as exc:  # noqa: BLE001
-            # 界面容错不能变成「静默吞掉」：统一落日志，traceback 里有精确位置
             self._log_error("ui", exc)
         self._schedule_hourly_stats()
 
     def _on_root_resize(self):
-        # 拖窗口时 <Configure> 每秒能触发几十次，而一次完整 refresh() 要跑
-        # 二十来条 SQL。原实现每次都 after_idle 一个完整 refresh()，事件积压
-        # 起来就表现为「时间条适配慢」。
-        #
-        # 现在拆成两层：
-        #  * 拖动过程中——卡片自己的 <Configure> 触发 _apply_card_widths，
-        #    只改行宽/换行/坐标，不建控件不查库，每帧跟手；
-        #  * 停手之后——防抖跑一次布局收尾（_on_resize_settled），
-        #    处理并排 <-> 竖排翻转，同样不查库。
+        if getattr(self, "_closing", False):
+            return
         try:
             if getattr(self, "_resize_timer", None):
                 self.root.after_cancel(self._resize_timer)
@@ -90,8 +85,6 @@ class RefreshMixin:
                                                  self._on_resize_settled)
         except tk.TclError:
             pass
-        # 内容宽度精确落位用更长的防抖单独安排：它比布局收尾贵一个数量级，
-        # 如果跟着 90ms 的防抖走，拖动中几乎每帧都会触发一次，节流就白做了
         try:
             if getattr(self, "_content_timer", None):
                 self.root.after_cancel(self._content_timer)
@@ -99,8 +92,6 @@ class RefreshMixin:
                                                   self._on_content_settled)
         except tk.TclError:
             pass
-        # 全局窗口缩放时，强制重置统计图尺寸缓存、启动防抖重绘，
-        # 否则画布沿用旧尺寸，切回统计页时只显示左上角一部分
         if getattr(self, "_stats_figs", None) is None:
             return
         new_size = (self.root.winfo_width(), self.root.winfo_height())
@@ -117,20 +108,11 @@ class RefreshMixin:
             self._stats_redraw_timer = self.root.after(60, self._draw_stats)
 
     def _on_resize_settled(self):
-        """缩放停手后的**布局**收尾（内容宽度重排见 ``_on_content_settled``）。
-
-        这里**不调用** ``refresh()``：窗口尺寸变化只影响布局，数据一点没变，
-        重新查库纯属浪费。一次完整刷新要跑二十来条 SQL 加图标查询，而拖拽
-        过程中 <Configure> 来得比这快得多，一旦在缩放路径上跑完整刷新就会
-        形成「慢帧 -> 定时器到期 -> 完整刷新 -> 更慢」的雪球，这正是
-        「时间条适配慢」的真正原因。
-
-        数据更新交给原本每 2 秒一次的 ``_refresh_loop``，缩放只做布局。
-        """
+        """缩放停手后的布局收尾（不重新查库）。"""
         self._resize_timer = None
+        if getattr(self, "_closing", False):
+            return
         try:
-            # 布局模式（并排 <-> 竖排）可能翻转，这一步只在真翻转时动 grid，
-            # 所以可以保持 90ms 的响应速度
             self._relayout_home_cards()
             self._relayout_categories()
         except Exception as exc:  # noqa: BLE001
@@ -141,18 +123,14 @@ class RefreshMixin:
             pass
 
     def _on_content_settled(self):
-        """内容宽度精确落位。
-
-        拖动过程中内容宽度是「量化 + 限流」跟进的，可能停在离目标不足一个
-        量化步长的位置；真正停手后在这里补一次精确值，保证缩到最小时右侧
-        不留误差（也不会因为差几个像素而被裁）。
-        """
+        """内容宽度精确落位。"""
         self._content_timer = None
+        if getattr(self, "_closing", False):
+            return
         try:
             force_all_content_resize()
         except Exception as exc:  # noqa: BLE001
             self._log_error("resize_content", exc)
-        # 内容宽度变了，卡片宽度要等几何计算落地后才拿得到，放进 idle
         try:
             self.root.after_idle(self._refresh_card_widths)
         except tk.TclError:
@@ -169,17 +147,19 @@ class RefreshMixin:
                 self.root.after_cancel(self._banner_timer)
             self._banner_timer = self.root.after(8000, self._hide_day_banner)
         except Exception as exc:  # noqa: BLE001
-            # 界面容错不能变成「静默吞掉」：统一落日志，traceback 里有精确位置
             self._log_error("ui", exc)
 
     def _hide_day_banner(self):
+        if getattr(self, "_closing", False):
+            return
         try:
             self.day_banner.pack_forget()
         except Exception as exc:  # noqa: BLE001
-            # 界面容错不能变成「静默吞掉」：统一落日志，traceback 里有精确位置
             self._log_error("ui", exc)
 
     def refresh(self):
+        if getattr(self, "_closing", False):
+            return
         # 下拉框点开不选被清空时，自动恢复当前值
         try:
             if not self.filter_combo.get():
@@ -202,25 +182,37 @@ class RefreshMixin:
             self._show_day_banner()
         self._last_refresh_date = today
 
-        # 各模块独立刷新，互不拖累（首页出错不影响分类 TOP3）；
-        # 同一时间窗只查一次库，snapshot 复用 apps/sites/cats
-        try:
-            snap = self._period_snapshot(start, now)
-        except Exception as exc:  # noqa: BLE001
-            self._log_error("snapshot", exc)
-            snap = None
-        try:
-            self._refresh_home(start, now, snapshot=snap)
-        except Exception as exc:  # noqa: BLE001
-            self._log_error("home", exc)
-        try:
-            self._refresh_categories(start, now, snapshot=snap)
-        except Exception as exc:  # noqa: BLE001
-            self._log_error("categories", exc)
-        try:
-            self._refresh_settings_live(now)
-        except Exception as exc:  # noqa: BLE001
-            self._log_error("settings_live", exc)
+        # 按需刷新当前可见页：后台未打开的页面不在每 2 秒周期里空转重算 UI，
+        # 切页时由 show_page() 立即补刷一次。
+        page = getattr(self, "current_page", "home")
+        if page in ("home", "categories"):
+            try:
+                snap = self._period_snapshot(start, now)
+            except Exception as exc:  # noqa: BLE001
+                self._log_error("snapshot", exc)
+                snap = None
+            if page == "home":
+                try:
+                    self._refresh_home(start, now, snapshot=snap)
+                except Exception as exc:  # noqa: BLE001
+                    self._log_error("home", exc)
+            else:
+                try:
+                    self._refresh_categories(start, now, snapshot=snap)
+                except Exception as exc:  # noqa: BLE001
+                    self._log_error("categories", exc)
+        elif page == "settings":
+            try:
+                self._refresh_settings_live(now)
+            except Exception as exc:  # noqa: BLE001
+                self._log_error("settings_live", exc)
+        elif page == "records":
+            try:
+                self._records_dirty = False
+                self._refresh_records()
+            except Exception as exc:  # noqa: BLE001
+                self._log_error("records", exc)
+
         try:
             running = self._background_running()
             if running:
@@ -231,9 +223,3 @@ class RefreshMixin:
                 self.status_text.config(text="后台未运行")
         except Exception as exc:  # noqa: BLE001
             self._log_error("status", exc)
-        if self.current_page == "records" and self._records_dirty:
-            try:
-                self._records_dirty = False
-                self._refresh_records()
-            except Exception as exc:  # noqa: BLE001
-                self._log_error("records", exc)

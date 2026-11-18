@@ -43,18 +43,32 @@ class BackgroundMixin:
             self._bg_proc = None
 
     def _stop_background_process(self):
+        """优先通过停止信号让后台采集保存最后一段会话并正常释放锁，超时后再强杀兜底。"""
+        try:
+            TrackingLock(self.cfg).request_stop(timeout=2.5)
+        except Exception:  # noqa: BLE001
+            pass
+
         if self._bg_proc is None:
             return
         if self._bg_proc.poll() is None:
             try:
-                self._bg_proc.terminate()
-                self._bg_proc.wait(timeout=3)
+                self._bg_proc.wait(timeout=1.0)
             except Exception:  # noqa: BLE001
                 try:
-                    self._bg_proc.kill()
+                    self._bg_proc.terminate()
+                    self._bg_proc.wait(timeout=2.0)
                 except Exception:  # noqa: BLE001
-                    pass
+                    try:
+                        self._bg_proc.kill()
+                    except Exception:  # noqa: BLE001
+                        pass
         self._bg_proc = None
+
+    def _restart_background(self):
+        """重启后台采集子进程（设置保存或排除列表变更后使新配置立即生效）。"""
+        self._stop_background_process()
+        self._spawn_background()
 
     # ---------- 系统托盘 ----------
     def _setup_tray(self):
@@ -64,10 +78,12 @@ class BackgroundMixin:
             self._tray_icon_path = icon_dir / "tray_icon.ico"
             if not tray.create_icon(self._tray_icon_path):
                 return
+            # 通过 after(0, ...) 异步切回 Tk 主循环执行，避免在托盘消息窗口自身的
+            # _wnd_proc 调用栈内重入销毁窗口。
             self._tray_enabled = tray.enable_tray(
                 str(self._tray_icon_path),
-                on_open=self._restore_from_tray,
-                on_quit=self._quit_app,
+                on_open=lambda: self.root.after(0, self._restore_from_tray),
+                on_quit=lambda: self.root.after(0, self._quit_app),
                 tooltip="屏幕使用时间 · 使用时长记录",
             )
         except Exception as exc:  # noqa: BLE001
@@ -76,23 +92,27 @@ class BackgroundMixin:
             self._tray_enabled = False
 
     def _restore_from_tray(self):
+        if getattr(self, "_closing", False):
+            return
+        self._hidden_to_tray = False
         try:
             self.root.deiconify()
             self.root.state("normal")
             self.root.lift()
             self.root.focus_force()
             self.root.title("屏幕使用时间")
+            if getattr(self, "current_page", "") == "settings" and hasattr(self, "_preview"):
+                self._preview.set_active(True)
+            if getattr(self, "_refresh_timer", None) is None:
+                self._refresh_loop()
+            elif getattr(self, "current_page", "") == "stats":
+                self._schedule_stats_draw()
         except tk.TclError:
             pass
 
     # ---------- 数据校验（只读） ----------
     def _check_overlap_sessions(self):
-        """启动时只在最近 7 天内查重叠记录。
-
-        原实现是无条件全表自连接，历史数据攒到几十万条后，每次打开界面
-        都要做一遍 O(n²) 扫描。这里改成限定时间范围 + 只取是否存在，
-        完整检查交给 ``python main.py doctor``。
-        """
+        """启动时只在最近 7 天内查重叠记录。"""
         try:
             since = datetime.now() - timedelta(days=7)
             pairs = self.db.find_overlapping_sessions(since=since, limit=1)
@@ -108,14 +128,7 @@ class BackgroundMixin:
                 "如需完整检查，请在项目目录运行：python main.py doctor"))
 
     def _background_running(self) -> bool:
-        """后台采集是否在跑——直接问采集锁，不再自己解析锁文件。
-
-        原实现用裸 ``OpenProcess`` 判断 PID 存活，对「刚退出但内核对象
-        尚未回收」的进程同样会返回句柄，于是会把已经崩掉的采集进程当成
-        还在运行，界面既不会重新拉起、用户也看不出问题。这里改为复用
-        ``TrackingLock.holder_alive()``（内部有 ``GetExitCodeProcess``
-        与创建时间双重校验）。
-        """
+        """后台采集是否在跑——直接复用 TrackingLock.holder_alive()。"""
         try:
             return TrackingLock(self.cfg).holder_alive()
         except LockError:

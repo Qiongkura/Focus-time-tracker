@@ -8,11 +8,17 @@ from __future__ import annotations
 
 import tkinter as tk
 from datetime import datetime, timedelta
+from tkinter import messagebox
 
 from .. import theme
 from ..utils import fmt_minsec
 from ..widgets import (
-    ScrollArea, get_default_icon, get_display_name, get_exe_icon, get_globe_icon,
+    RoundedButton,
+    ScrollArea,
+    get_default_icon,
+    get_display_name,
+    get_exe_icon,
+    get_globe_icon,
 )
 from .common import shorten, site_display
 
@@ -23,19 +29,7 @@ RECORDS_CHUNK = 12
 
 
 def group_sessions(rows, fallback_end: datetime) -> list[dict]:
-    """把会话行按「小时 + 身份」合并为展示用记录行。
-
-    - 身份：网站按站点合并，其余按进程名合并；
-    - 同一小时内反复出现的同一身份只保留一行，时长累加、次数累加；
-    - 标题/站点取该小时内时长最长的那次（``best`` 用 ``>=`` 更新，
-      所以并列时保留后出现的一条）。
-
-    排序：按 ``start`` 倒序（最近的小时在前）。注意 ``key`` 里的
-    ``-seconds`` 配合 ``reverse=True`` 后会被再次反转，因此 ``start``
-    相同的分组实际是「时长升序」——这是拆分前就有的行为，这里原样保留。
-
-    纯函数，不碰数据库也不碰 Tk，便于单测。
-    """
+    """把会话行按「小时 + 身份」合并为展示用记录行。"""
     groups: dict[tuple, dict] = {}
     for r in rows:
         try:
@@ -64,55 +58,80 @@ def group_sessions(rows, fallback_end: datetime) -> list[dict]:
 
 
 class RecordsPageMixin:
-    """详细记录页的构建、合并与分批渲染。"""
+    """详细记录页的构建、合并、CSV 导出与分批渲染。"""
 
-    # ---------- 详细记录页 ----------
     def _build_records(self):
         page = self.pages["records"]
-        # min_width 必须 ≤ 最小窗口可用宽度，否则窗口缩到最小时内容比画布宽，
-        # 右侧会被挤到横向滚动条外（最小窗口 760 - 侧边栏 160 = 600 逻辑像素，
-        # 再给竖向滚动条留一点余量）
         sc = ScrollArea(page, bg=theme.BG, min_width=560)
         sc.pack(fill="both", expand=True)
         inner = sc.inner
-        tk.Label(inner, text="详细记录", font=theme.font(22, True), fg=theme.TEXT_TITLE,
-                 bg=theme.BG).pack(anchor="w", padx=theme.scale(28), pady=(theme.scale(32), theme.scale(16)))
-        self.records_inner = inner
+
+        header = tk.Frame(inner, bg=theme.BG)
+        header.pack(fill="x", padx=theme.scale(28), pady=(theme.scale(32), theme.scale(16)))
+        tk.Label(header, text="详细记录", font=theme.font(22, True), fg=theme.TEXT_TITLE,
+                 bg=theme.BG).pack(side="left")
+        self._make_period_tabs(header)
+        RoundedButton(
+            header, text="导出 CSV", width=88, height=30, radius=6,
+            font=theme.font(9), fill=theme.SECONDARY_BG, fg=theme.TEXT,
+            bg=theme.BG, command=self._export_records_csv,
+        ).pack(side="right", padx=(0, 8))
+
+        self.records_list = tk.Frame(inner, bg=theme.BG)
+        self.records_list.pack(fill="x", padx=theme.scale(28), pady=(0, theme.scale(24)))
+        self.records_inner = self.records_list
         self._records_sig = None
         self._records_built = False
 
+    def _export_records_csv(self):
+        try:
+            start = self._period_start()
+            now = datetime.now()
+            out_dir = getattr(self, "report_dir", self.db.db_path.parent)
+            out_path = out_dir / f"详细记录_{self.period}_{now:%Y%m%d_%H%M%S}.csv"
+            count = self.db.export_sessions_csv(start, now, out_path)
+            messagebox.showinfo("导出 CSV", f"已导出 {count} 条会话明细至：\n{out_path}")
+        except Exception as exc:  # noqa: BLE001
+            self._log_error("export_csv", exc)
+            messagebox.showerror("导出失败", f"导出 CSV 失败：{exc}")
+
     def _refresh_records(self):
+        if getattr(self, "_closing", False):
+            return
         end = datetime.now()
         start = self._period_start()
         inner = self.records_inner
-        # 数据没变化时直接复用已构建的行，避免每次点开都全量销毁重建（卡顿根源）
         try:
-            sig = self.db.conn.execute(
-                "SELECT COUNT(*), COALESCE(MAX(id), 0), COALESCE(SUM(duration), 0) "
-                "FROM sessions WHERE start_time >= ? AND start_time < ?",
-                (start.isoformat(timespec="seconds"), end.isoformat(timespec="seconds")),
-            ).fetchone()
+            if hasattr(self.db, "sessions_signature_between"):
+                sig = self.db.sessions_signature_between(start, end)
+            else:
+                sig = self.db.conn.execute(
+                    "SELECT COUNT(*), COALESCE(MAX(id), 0), COALESCE(SUM(duration), 0) "
+                    "FROM sessions WHERE start_time >= ? AND start_time < ?",
+                    (start.isoformat(timespec="seconds"), end.isoformat(timespec="seconds")),
+                ).fetchone()
         except Exception:  # noqa: BLE001
             sig = None
         if self._records_built and sig == self._records_sig:
             return
         self._records_sig = sig
         self._records_built = True
-        # 取消可能还在进行中的分批构建
         self._records_build_id = getattr(self, "_records_build_id", 0) + 1
+        tid = getattr(self, "_records_chunk_timer", None)
+        if tid:
+            try:
+                self.root.after_cancel(tid)
+            except tk.TclError:
+                pass
+            self._records_chunk_timer = None
         for w in inner.winfo_children():
-            if isinstance(w, tk.Label) and w.cget("text") == "详细记录":
-                continue
             w.destroy()
         rows = self.db.recent_sessions_between(start, end, limit=2000)
         if not rows:
             tk.Label(inner, text="暂无记录", font=theme.font(11), fg=theme.SUB,
                      bg=theme.BG).pack(pady=40)
             return
-        # 按「小时 + 相同进程」合并为一条记录（网站按站点合并），
-        # 同一小时内反复出现同一程序只显示一行，时长累加。
         ordered = group_sessions(rows, end)
-        # 分批流式构建：先画一批立即可见，其余用 idle 回调接力，避免一次创建几百行卡死界面
         self._records_pending = ordered
         self._records_chunk_i = 0
         self._build_records_chunk(self._records_build_id)
@@ -151,7 +170,6 @@ class RecordsPageMixin:
         chip = tk.Label(row, text=g["category"], font=theme.font(9), fg="#FFFFFF",
                         bg=color, padx=6)
         chip.pack(side="left", padx=8)
-        # 分类小标签保持原色，hover 只改变行背景与文字颜色
         targets = (time_lbl, range_lbl, icon_lbl, name_lbl)
 
         def _enter(_e, f=row, t=targets):
@@ -172,8 +190,11 @@ class RecordsPageMixin:
 
     def _build_records_chunk(self, build_id):
         """分批构建记录行（每批 12 行），页面即时响应、内容流式出现。"""
+        if getattr(self, "_closing", False):
+            return
         if build_id != getattr(self, "_records_build_id", -1):
             return  # 已被新一次重建取代
+        self._records_chunk_timer = None
         inner = self.records_inner
         pending = getattr(self, "_records_pending", [])
         chunk = RECORDS_CHUNK
@@ -186,7 +207,8 @@ class RecordsPageMixin:
         self._records_chunk_i = i + chunk
         if self._records_chunk_i < len(pending):
             try:
-                # 用 after(0) 而非 after_idle：每批之间让事件循环有机会重绘，页面边出现边加载
-                self.root.after(0, lambda: self._build_records_chunk(build_id))
+                self._records_chunk_timer = self.root.after(
+                    0, lambda: self._build_records_chunk(build_id)
+                )
             except tk.TclError:
-                pass
+                self._records_chunk_timer = None
