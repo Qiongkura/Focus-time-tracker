@@ -69,18 +69,23 @@ DEFAULT_RULES = {
 
 _lock = threading.Lock()
 _cache: dict | None = None
+_mtime: int | None = None
+
+
+def rules_path() -> Path:
+    return project_root() / GAME_RULES_FILENAME
 
 
 def load_rules(path: Path | None = None) -> dict:
     """加载规则：内置默认值 + 用户 game_rules.json（默认追加，replace_defaults 时整体替换）。"""
     rules = {key: list(values) for key, values in DEFAULT_RULES.items()}
     if path is None:
-        path = project_root() / GAME_RULES_FILENAME
+        path = rules_path()
     path = Path(path)
     if not path.exists():
         return rules
     try:
-        with open(path, "r", encoding="utf-8") as f:
+        with open(path, encoding="utf-8") as f:
             user = json.load(f)
     except Exception:
         return rules
@@ -100,20 +105,32 @@ def load_rules(path: Path | None = None) -> dict:
 
 
 def _rules() -> dict:
-    global _cache
-    if _cache is not None:
+    """文件 mtime 变化时自动重新加载，改完 game_rules.json 无需重启即可生效。"""
+    global _cache, _mtime
+    path = rules_path()
+    try:
+        current = path.stat().st_mtime_ns
+    except OSError:
+        current = None
+    if _cache is not None and current == _mtime:
         return _cache
     with _lock:
-        if _cache is None:
-            _cache = load_rules()
+        if _cache is None or current != _mtime:
+            _cache = load_rules(path)
+            _mtime = current
         return _cache
 
 
 def reload_rules() -> dict:
-    """重新加载规则（改完 game_rules.json 后调用，供测试使用）。"""
-    global _cache
+    """强制重新加载规则并同步文件时间戳缓存。"""
+    global _cache, _mtime
     with _lock:
-        _cache = load_rules()
+        path = rules_path()
+        try:
+            _mtime = path.stat().st_mtime_ns
+        except OSError:
+            _mtime = None
+        _cache = load_rules(path)
         return _cache
 
 

@@ -1,11 +1,13 @@
 """SQLite 存储：会话记录与聚合查询。"""
 from __future__ import annotations
 
+import csv
 import sqlite3
 import threading
 from datetime import datetime, timedelta
 from pathlib import Path
 
+from .browser import BROWSER_PROCESSES
 from .config import project_root
 from .privacy import UrlPolicy
 from .utils import clean_site_text, normalize_site_key
@@ -47,7 +49,7 @@ CREATE INDEX IF NOT EXISTS idx_sessions_start_category ON sessions(start_time, c
 CREATE INDEX IF NOT EXISTS idx_sessions_start_process ON sessions(start_time, process);
 """
 
-_BROWSER_PROCESSES = ("chrome.exe", "msedge.exe", "firefox.exe")
+_BROWSER_PROCESSES = tuple(sorted(BROWSER_PROCESSES))
 
 
 def _split_by_day(start: datetime, end: datetime):
@@ -72,6 +74,8 @@ class UsageDB:
         # check_same_thread=False：监控线程写、GUI 线程读
         self.conn = sqlite3.connect(str(self.db_path), check_same_thread=False)
         self.conn.execute("PRAGMA journal_mode=WAL")
+        self.conn.execute("PRAGMA synchronous=NORMAL")
+        self.conn.execute("PRAGMA busy_timeout=5000")
         self.conn.executescript(_SCHEMA)
         self._lock = threading.Lock()
         self._migrate()
@@ -110,9 +114,10 @@ class UsageDB:
 
     def _reclassify_all(self):
         """全量回填：浏览器会话分类、游戏规则、手动覆盖。"""
+        marks = ",".join("?" * len(_BROWSER_PROCESSES))
         self.conn.execute(
             "UPDATE sessions SET category='网站' WHERE category='应用' AND site='' "
-            "AND lower(process) IN (?, ?, ?)",
+            f"AND lower(process) IN ({marks})",
             _BROWSER_PROCESSES,
         )
         self._backfill_games()
@@ -399,6 +404,60 @@ class UsageDB:
             }
             for r in rows
         ]
+
+    def latest_exe_path(self, process: str) -> str:
+        """从历史会话中查找某进程最近一次非空的 exe_path（线程安全）。"""
+        if not process:
+            return ""
+        with self._lock:
+            row = self.conn.execute(
+                "SELECT exe_path FROM sessions WHERE process=? AND exe_path<>'' "
+                "ORDER BY id DESC LIMIT 1",
+                (process,),
+            ).fetchone()
+        return row[0] if row and row[0] else ""
+
+    def sessions_signature_between(self, start: datetime,
+                                   end: datetime) -> tuple[int, int, float]:
+        """返回指定区间会话的数据指纹（行数、最大 id、总时长），供详细记录页跳过无变化重建。"""
+        with self._lock:
+            row = self.conn.execute(
+                "SELECT COUNT(*), COALESCE(MAX(id), 0), COALESCE(SUM(duration), 0) "
+                "FROM sessions WHERE start_time >= ? AND start_time < ?",
+                (start.isoformat(timespec="seconds"), end.isoformat(timespec="seconds")),
+            ).fetchone()
+        return (int(row[0]), int(row[1]), float(row[2]))
+
+    def hourly_sessions_between(self, start: datetime,
+                                end: datetime) -> list[tuple[str, str, str]]:
+        """返回指定区间的 ``(category, start_time, end_time)`` 列表，供按小时分桶。"""
+        with self._lock:
+            return self.conn.execute(
+                "SELECT category, start_time, end_time FROM sessions "
+                "WHERE start_time >= ? AND start_time < ?",
+                (start.isoformat(timespec="seconds"), end.isoformat(timespec="seconds")),
+            ).fetchall()
+
+    def export_sessions_csv(self, start: datetime, end: datetime, out_path: Path) -> int:
+        """导出指定时间区间的会话明细为 UTF-8-BOM CSV（Excel 直接打开不乱码），返回导出行数。"""
+        out_path = Path(out_path)
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        with self._lock:
+            rows = self.conn.execute(
+                "SELECT start_time, end_time, duration, category, process, site, "
+                "window_title, url, exe_path "
+                "FROM sessions WHERE start_time >= ? AND start_time < ? "
+                "ORDER BY start_time DESC",
+                (start.isoformat(timespec="seconds"), end.isoformat(timespec="seconds")),
+            ).fetchall()
+        with open(out_path, "w", encoding="utf-8-sig", newline="") as f:
+            writer = csv.writer(f)
+            writer.writerow([
+                "开始时间", "结束时间", "时长(秒)", "分类",
+                "进程", "站点", "窗口标题", "URL", "程序路径",
+            ])
+            writer.writerows(rows)
+        return len(rows)
 
     # ---------- 数据保留与维护 ----------
 

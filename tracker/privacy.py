@@ -24,7 +24,7 @@ class UrlPolicy:
         self.strip_query = bool(strip_query)
 
     @classmethod
-    def from_config(cls, cfg: dict | None) -> "UrlPolicy":
+    def from_config(cls, cfg: dict | None) -> UrlPolicy:
         cfg = cfg or {}
         return cls(
             store_full_url=bool(cfg.get("store_full_url", True)),

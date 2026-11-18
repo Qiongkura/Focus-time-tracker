@@ -25,7 +25,7 @@ APPS = [
     ("QQ.exe", "QQ", "QQ", "", "应用", "", ""),
     ("cs2.exe", "Counter-Strike 2", "Counter-Strike 2", "", "游戏", "",
      r"C:\Program Files (x86)\Steam\steamapps\common\Counter-Strike Global Offensive\cs2.exe"),
-    ("", "锁屏", "", "", "系统", "", ""),
+    ("锁屏", "锁屏", "", "", "系统", "", ""),
 ]
 
 
@@ -44,6 +44,6 @@ def seed_demo_data(db: UsageDB, days: int = 7):
             end = min(t + timedelta(minutes=random.randint(5, 90)), horizon)
             if end <= t:
                 break
-            db.add_session(t, end, app[1], app[6], app[2], app[4], app[5], app[3])
+            db.add_session(t, end, app[0], app[6], app[2], app[4], app[5], app[3])
             t = end + timedelta(minutes=random.randint(2, 30))
     print(f"已为最近 {days} 天生成示例数据")

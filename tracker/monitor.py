@@ -3,7 +3,7 @@
 内部按职责拆成几个可单独测试的组件：
 
 * :class:`WindowSampler`      —— 取前台窗口信息（采集函数可注入，便于测试）
-* :class:`SessionAccumulator` —— 维护「当前会话」，处理切段与 checkpoint
+* :class:`SessionAccumulator` —— 维护「当前会话」，处理切段、checkpoint 与睡眠跨越
 * :class:`SessionWriter`      —— 把会话段写进数据库
 * :class:`TrackingService`    —— 编排上面几者的主循环
 
@@ -15,50 +15,75 @@ from __future__ import annotations
 import ctypes
 import os
 import time
-from ctypes import wintypes
 from datetime import datetime
 from pathlib import Path
 
-from .browser import resolve_site
+from .browser import BROWSER_PROCESSES, resolve_site
 from .config import MIN_POLL_INTERVAL
 from .games import is_game
 from .overrides import override_for
 
-if os.name != "nt":
-    raise RuntimeError("本工具仅支持 Windows（依赖 Win32 API 获取前台窗口）")
-
-user32 = ctypes.windll.user32
-kernel32 = ctypes.windll.kernel32
-
 PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
-
-# 声明函数签名，避免 64 位指针被截断
-user32.GetForegroundWindow.restype = wintypes.HWND
-user32.GetWindowThreadProcessId.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.DWORD)]
-user32.GetWindowThreadProcessId.restype = wintypes.DWORD
-user32.GetWindowTextLengthW.argtypes = [wintypes.HWND]
-user32.GetWindowTextLengthW.restype = ctypes.c_int
-user32.GetWindowTextW.argtypes = [wintypes.HWND, wintypes.LPWSTR, ctypes.c_int]
-user32.GetWindowTextW.restype = ctypes.c_int
-user32.GetClassNameW.argtypes = [wintypes.HWND, wintypes.LPWSTR, ctypes.c_int]
-user32.GetClassNameW.restype = ctypes.c_int
-user32.IsIconic.argtypes = [wintypes.HWND]
-user32.IsIconic.restype = wintypes.BOOL
-
-kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
-kernel32.OpenProcess.restype = wintypes.HANDLE
-kernel32.QueryFullProcessImageNameW.argtypes = [
-    wintypes.HANDLE, wintypes.DWORD, wintypes.LPWSTR, ctypes.POINTER(wintypes.DWORD),
-]
-kernel32.QueryFullProcessImageNameW.restype = wintypes.BOOL
-kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
-
 SPECIAL_CLASSES = {"Progman": "桌面", "WorkerW": "桌面", "LockScreen": "锁屏"}
-BROWSER_PROCESSES = {"chrome.exe", "msedge.exe", "firefox.exe"}
+
+if os.name == "nt":
+    from ctypes import wintypes
+
+    user32 = ctypes.windll.user32
+    kernel32 = ctypes.windll.kernel32
+
+    class _LASTINPUTINFO(ctypes.Structure):
+        _fields_ = [("cbSize", wintypes.UINT), ("dwTime", wintypes.DWORD)]
+
+    # 声明函数签名，避免 64 位指针被截断
+    user32.GetForegroundWindow.restype = wintypes.HWND
+    user32.GetWindowThreadProcessId.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.DWORD)]
+    user32.GetWindowThreadProcessId.restype = wintypes.DWORD
+    user32.GetWindowTextLengthW.argtypes = [wintypes.HWND]
+    user32.GetWindowTextLengthW.restype = ctypes.c_int
+    user32.GetWindowTextW.argtypes = [wintypes.HWND, wintypes.LPWSTR, ctypes.c_int]
+    user32.GetWindowTextW.restype = ctypes.c_int
+    user32.GetClassNameW.argtypes = [wintypes.HWND, wintypes.LPWSTR, ctypes.c_int]
+    user32.GetClassNameW.restype = ctypes.c_int
+    user32.IsIconic.argtypes = [wintypes.HWND]
+    user32.IsIconic.restype = wintypes.BOOL
+    user32.GetLastInputInfo.argtypes = [ctypes.POINTER(_LASTINPUTINFO)]
+    user32.GetLastInputInfo.restype = wintypes.BOOL
+
+    kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+    kernel32.OpenProcess.restype = wintypes.HANDLE
+    kernel32.QueryFullProcessImageNameW.argtypes = [
+        wintypes.HANDLE, wintypes.DWORD, wintypes.LPWSTR, ctypes.POINTER(wintypes.DWORD),
+    ]
+    kernel32.QueryFullProcessImageNameW.restype = wintypes.BOOL
+    kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+    kernel32.GetTickCount.restype = wintypes.DWORD
+else:  # pragma: no cover - 允许非 Windows 环境导入纯逻辑组件做单测
+    wintypes = None
+    user32 = None
+    kernel32 = None
+    _LASTINPUTINFO = None
+
+
+def get_idle_seconds() -> float:
+    """返回当前用户键鼠无操作的秒数；不支持或失败时返回 0.0。"""
+    if os.name != "nt" or user32 is None or kernel32 is None or _LASTINPUTINFO is None:
+        return 0.0
+    try:
+        lii = _LASTINPUTINFO()
+        lii.cbSize = ctypes.sizeof(_LASTINPUTINFO)
+        if not user32.GetLastInputInfo(ctypes.byref(lii)):
+            return 0.0
+        elapsed_ms = (int(kernel32.GetTickCount()) - int(lii.dwTime)) & 0xFFFFFFFF
+        return elapsed_ms / 1000.0
+    except Exception:
+        return 0.0
 
 
 def _process_name_of(pid: int):
     """根据 PID 返回 (进程名, 完整路径)。"""
+    if kernel32 is None or wintypes is None:
+        return "未知进程", ""
     handle = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
     if not handle:
         return "未知进程", ""
@@ -75,6 +100,8 @@ def _process_name_of(pid: int):
 
 def _collect_window() -> dict | None:
     """Win32 采集原始前台窗口数据；无窗口时返回 None。测试可替换此函数。"""
+    if os.name != "nt" or user32 is None or wintypes is None:
+        raise RuntimeError("本工具仅支持 Windows（依赖 Win32 API 获取前台窗口）")
     hwnd = user32.GetForegroundWindow()
     if not hwnd:
         return None
@@ -109,7 +136,6 @@ def classify_window(process: str = "", exe_path: str = "", title: str = "",
                     class_name: str = "", minimized: bool = False,
                     hwnd: int = 0, pid: int = 0) -> dict:
     """纯分类逻辑：系统（桌面/锁屏/最小化） > 手动覆盖 > 游戏（规则引擎） > 网站 > 应用。"""
-    # 分类：系统（桌面/锁屏/最小化） > 手动覆盖（应用/游戏） > 游戏（规则引擎） > 网站 > 应用
     category = "应用"
     if class_name in SPECIAL_CLASSES:
         process, exe_path = SPECIAL_CLASSES[class_name], ""
@@ -209,26 +235,49 @@ class SessionWriter:
 
 
 class SessionAccumulator:
-    """维护「当前会话」，决定切段与长会话 checkpoint。
+    """维护「当前会话」，决定切段、长会话 checkpoint 与系统睡眠跨越保护。
 
     它不直接写库，只交出「该写哪一段、写到什么时刻」，落库交给
     :class:`SessionWriter`——这样切段逻辑可以脱离数据库单独测试。
     """
 
-    def __init__(self, min_session: float = 3.0, checkpoint_seconds: float = 45.0):
+    def __init__(self, min_session: float = 3.0, checkpoint_seconds: float = 45.0,
+                 max_gap_seconds: float | None = None):
         self.min_session = max(0.0, float(min_session))
         self.checkpoint_seconds = float(checkpoint_seconds)
+        self.max_gap_seconds = (
+            float(max_gap_seconds)
+            if max_gap_seconds is not None and max_gap_seconds > 0
+            else None
+        )
         self.current: dict | None = None
         self.last_checkpoint: datetime | None = None
+        self.last_seen: datetime | None = None
 
     def observe(self, info: dict | None, now: datetime) -> list[tuple[dict, datetime]]:
         """喂入一次采样，返回本次需要落库的 ``(session, end_time)`` 列表。"""
         pending: list[tuple[dict, datetime]] = []
 
+        # 系统睡眠 / 休眠跨越保护：两次采样间隔远超正常上限时，旧会话截断在
+        # 上一次采样时刻 last_seen，避免合盖睡眠数小时被计入睡眠前的窗口。
+        if (self.current is not None
+                and self.last_seen is not None
+                and self.max_gap_seconds is not None
+                and (now - self.last_seen).total_seconds() > self.max_gap_seconds):
+            segment = self._close(self.last_seen)
+            if segment:
+                pending.append(segment)
+
+        # 系统时钟回拨保护
+        if self.current is not None and now < self.current["start"]:
+            self.current["start"] = now
+            self.last_checkpoint = now
+
         if info is None:
             segment = self._close(now)
             if segment:
                 pending.append(segment)
+            self.last_seen = now
             return pending
 
         key = _session_key(info)
@@ -243,6 +292,7 @@ class SessionAccumulator:
                 self.current = dict(self.current)
                 self.current["start"] = now
                 self.last_checkpoint = now
+            self.last_seen = now
             return pending
 
         segment = self._close(now)
@@ -259,10 +309,16 @@ class SessionAccumulator:
             "start": now,
         }
         self.last_checkpoint = now
+        self.last_seen = now
         return pending
 
     def flush(self, now: datetime) -> tuple[dict, datetime] | None:
         """退出时交出最后一段（没有进行中的会话则返回 None）。"""
+        if (self.current is not None
+                and self.last_seen is not None
+                and self.max_gap_seconds is not None
+                and (now - self.last_seen).total_seconds() > self.max_gap_seconds):
+            return self._close(self.last_seen)
         return self._close(now)
 
     def _close(self, now: datetime) -> tuple[dict, datetime] | None:
@@ -271,6 +327,7 @@ class SessionAccumulator:
         segment = (self.current, now)
         self.current = None
         self.last_checkpoint = None
+        self.last_seen = None
         return segment
 
     @staticmethod
@@ -284,18 +341,25 @@ class SessionAccumulator:
 class TrackingService:
     """编排「采样 → 分类 → 累积 → 落库」的主循环。"""
 
-    def __init__(self, db, cfg: dict, stop_event=None, fetch_info=None):
+    def __init__(self, db, cfg: dict, stop_event=None, fetch_info=None,
+                 stop_check=None, idle_fn=None):
         # 下限保护：本类也可能被直接构造，此时 cfg 未必经过 config.normalize_config
         self.interval = max(
             MIN_POLL_INTERVAL, float(cfg.get("poll_interval_seconds", 1.0) or 1.0))
         min_session = max(0.0, float(cfg.get("min_session_seconds", 3) or 0))
+        checkpoint_seconds = float(cfg.get("checkpoint_seconds", 45.0) or 45.0)
+        max_gap = max(checkpoint_seconds * 2.5, self.interval * 10.0 + 60.0)
+        self.idle_timeout = max(0.0, float(cfg.get("idle_timeout_seconds", 0) or 0))
         self.stop_event = stop_event
+        self._stop_check = stop_check
+        self._idle_fn = idle_fn or get_idle_seconds
         # fetch_info 可注入；默认走模块级 get_foreground_info，测试常替换它
         self.fetch_info = fetch_info or get_foreground_info
         self.browser_site_tracking = bool(cfg.get("browser_site_tracking", True))
         self.accumulator = SessionAccumulator(
             min_session=min_session,
-            checkpoint_seconds=float(cfg.get("checkpoint_seconds", 45.0) or 45.0),
+            checkpoint_seconds=checkpoint_seconds,
+            max_gap_seconds=max_gap,
         )
         self.writer = SessionWriter(db, min_session=min_session)
         # 进程名统一小写比较：Windows 返回 chrome.exe，而用户习惯按 Chrome.exe 配置
@@ -303,21 +367,24 @@ class TrackingService:
                         for name in (cfg.get("exclude_processes") or [])}
 
     def run(self) -> None:
-        """主循环；Ctrl+C 或 stop_event 触发时优雅退出。"""
-        print("开始记录前台窗口使用时长（按 Ctrl+C 停止）...")
+        """主循环；Ctrl+C、stop_event 或外部停止信号触发时优雅退出。"""
+        _safe_print("开始记录前台窗口使用时长（按 Ctrl+C 停止）...")
         try:
             while not self._stopped():
                 self.tick()
                 if self._wait():
                     break
         except KeyboardInterrupt:
-            print("\n正在保存最后一段会话并退出...")
+            _safe_print("\n正在保存最后一段会话并退出...")
         finally:
             self._flush()
 
     def tick(self) -> None:
         """采样一次，并落库本次需要结束的会话段。"""
-        info = self.fetch_info()
+        if self.idle_timeout > 0 and self._idle_fn() >= self.idle_timeout:
+            info = None
+        else:
+            info = self.fetch_info()
 
         if info is not None and not self.browser_site_tracking and info["category"] == "网站":
             # 关闭网站细分后，浏览器按普通应用统计
@@ -335,20 +402,49 @@ class TrackingService:
             self.writer.write(session, end)
 
     def _stopped(self) -> bool:
-        return self.stop_event is not None and self.stop_event.is_set()
+        if self.stop_event is not None and self.stop_event.is_set():
+            return True
+        if self._stop_check is not None:
+            try:
+                return bool(self._stop_check())
+            except Exception:
+                return False
+        return False
 
     def _wait(self) -> bool:
         """等待一个采样间隔；返回 True 表示收到停止信号。"""
-        if self.stop_event is not None:
-            # 用 wait 代替 sleep：收到停止信号时立即返回，不必等满一个间隔
-            return bool(self.stop_event.wait(self.interval))
-        time.sleep(self.interval)
-        return False
+        if self._stop_check is None:
+            if self.stop_event is not None:
+                return bool(self.stop_event.wait(self.interval))
+            time.sleep(self.interval)
+            return False
+
+        deadline = time.monotonic() + self.interval
+        while True:
+            if self._stopped():
+                return True
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return self._stopped()
+            step = min(0.25, remaining)
+            if self.stop_event is not None:
+                if self.stop_event.wait(step):
+                    return True
+            else:
+                time.sleep(step)
 
     def _flush(self) -> None:
         segment = self.accumulator.flush(datetime.now())
         if segment:
             self.writer.write(*segment)
+
+
+def _safe_print(text: str) -> None:
+    """兼容 pythonw / PyInstaller 无控制台模式的输出，避免无 stdout 时抛异常中断采集。"""
+    try:
+        print(text)
+    except Exception:
+        pass
 
 
 # ---------- 兼容层（保持原有模块级接口） ----------
@@ -368,9 +464,9 @@ def _close_session(db, current, now, min_session):
     _write_segment(db, current, now, min_session)
 
 
-def run_tracking(db, cfg: dict, stop_event=None) -> None:
-    """前台窗口采样主循环，Ctrl+C 或 stop_event 优雅退出。
+def run_tracking(db, cfg: dict, stop_event=None, stop_check=None) -> None:
+    """前台窗口采样主循环，Ctrl+C、stop_event 或 stop_check 优雅退出。
 
     长会话每隔 checkpoint_seconds 落盘一段，进程被强杀时最多丢一段间隔内的时长。
     """
-    TrackingService(db, cfg, stop_event).run()
+    TrackingService(db, cfg, stop_event, stop_check=stop_check).run()

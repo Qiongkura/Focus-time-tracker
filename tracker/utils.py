@@ -3,14 +3,14 @@ from __future__ import annotations
 
 import re
 
-
 _ZERO_WIDTH = "".join(chr(c) for c in (0x200B, 0x200C, 0x200D, 0xFEFF))
 # 多标签窗口标题：从“和另外 N 个页面”开始全部去掉（N 不同不应算不同网站）
 _TAB_SUFFIX_RE = re.compile(r"\s*和另外\s*\d+\s*个页面.*$")
 # 尾部浏览器名 / 个人 后缀（容忍中间有零宽空格）
 _BROWSER_SUFFIX_RE = re.compile(
     r"\s*[-—|·]\s*(?:个人\s*)?(?:谷歌 ?chrome|google chrome|microsoft ?edge|microsoft|"
-    r"edge|chrome|firefox|网页|internet explorer)\s*$",
+    r"edge|chrome|firefox|mozilla firefox|brave|vivaldi|opera|arc|qq浏览器|360极速浏览器|"
+    r"360安全浏览器|网页|internet explorer)\s*$",
     re.IGNORECASE,
 )
 _PERSONAL_SUFFIX_RE = re.compile(r"\s*[-—|·]\s*个人\s*$")

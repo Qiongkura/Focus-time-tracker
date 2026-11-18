@@ -15,6 +15,7 @@
 from __future__ import annotations
 
 import os
+import time
 from pathlib import Path
 
 from .config import project_root
@@ -82,6 +83,7 @@ class TrackingLock:
             cfg = cfg or {}
             path = project_root() / cfg.get("data_dir", "data") / "tracking.lock"
         self.path = Path(path)
+        self.stop_path = self.path.with_suffix(".stop")
         self._held = False
 
     # ---------- 对外接口 ----------
@@ -118,6 +120,7 @@ class TrackingLock:
             finally:
                 os.close(fd)
 
+            self.clear_stop()
             self._held = True
             return True
 
@@ -153,6 +156,7 @@ class TrackingLock:
             self.path.unlink(missing_ok=True)
         except OSError as exc:
             raise LockError(f"无法删除锁文件 {self.path}：{exc}") from exc
+        self.clear_stop()
         self._held = False
 
     def force_unlock(self) -> bool:
@@ -166,8 +170,60 @@ class TrackingLock:
             self.path.unlink(missing_ok=True)
         except OSError as exc:
             raise LockError(f"无法清除锁文件 {self.path}：{exc}") from exc
+        self.clear_stop()
         self._held = False
         return existed
+
+    def clear_stop(self) -> None:
+        """清除优雅停止信号文件。"""
+        try:
+            self.stop_path.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+    def stop_requested(self) -> bool:
+        """是否收到外部请求优雅停止的信号。"""
+        return self.stop_path.exists()
+
+    def request_stop(self, timeout: float = 3.0) -> bool:
+        """通知正在运行的后台采集进程刷盘并优雅退出。
+
+        相比直接 ``TerminateProcess`` 强杀子进程，这种协作式停止能够让采集循环
+        执行 ``finally`` 中的 ``_flush()`` 与 ``lock.release()``，不丢最后一段会话、
+        也不留僵尸锁文件。
+
+        :returns: 在 ``timeout`` 内采集进程是否已完全退出。
+        """
+        try:
+            if not self.holder_alive():
+                self.clear_stop()
+                if self.path.exists():
+                    self._remove_stale()
+                return True
+        except LockError:
+            return False
+
+        try:
+            self.stop_path.parent.mkdir(parents=True, exist_ok=True)
+            self.stop_path.write_text("stop", encoding="utf-8")
+        except OSError:
+            return False
+
+        deadline = time.monotonic() + max(0.1, float(timeout))
+        try:
+            while time.monotonic() < deadline:
+                try:
+                    if not self.holder_alive():
+                        return True
+                except LockError:
+                    break
+                time.sleep(0.05)
+            try:
+                return not self.holder_alive()
+            except LockError:
+                return False
+        finally:
+            self.clear_stop()
 
     def holder_alive(self) -> bool:
         """锁是否正被一个仍然存活的进程持有（只读查询，不改动锁文件）。

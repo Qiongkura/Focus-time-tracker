@@ -2,35 +2,50 @@
 
 原理：浏览器窗口标题通常包含当前页面的标题；浏览器把访问记录写入 SQLite
 历史库。我们用窗口标题去历史库里匹配最近访问的页面，从而得到“正在看哪个网站”。
-支持 Chrome / Edge（同一套历史库结构）和 Firefox。
+支持 Chrome / Edge / Brave / Vivaldi / Opera / QQ 浏览器等 Chromium 系浏览器及 Firefox 系浏览器。
 """
 from __future__ import annotations
 
 import os
-import re
 import shutil
 import sqlite3
 import tempfile
+import threading
 import time
 from datetime import datetime, timezone
 from pathlib import Path
-from urllib.parse import urlparse
+from urllib.parse import quote, urlparse
 
 from .utils import clean_site_text
 
 CHROME_EDGE = {"chrome.exe", "msedge.exe"}
+CHROMIUM_BROWSERS = {
+    "chrome.exe",
+    "msedge.exe",
+    "brave.exe",
+    "vivaldi.exe",
+    "opera.exe",
+    "arc.exe",
+    "qqbrowser.exe",
+    "360chrome.exe",
+    "360se.exe",
+    "centbrowser.exe",
+    "chromium.exe",
+}
 FIREFOX = {"firefox.exe"}
+FIREFOX_BROWSERS = {"firefox.exe", "waterfox.exe", "librewolf.exe", "zen.exe"}
+BROWSER_PROCESSES = CHROMIUM_BROWSERS | FIREFOX_BROWSERS
 
 _CHROME_EPOCH = datetime(1601, 1, 1, tzinfo=timezone.utc)
 _UNIX_EPOCH = datetime(1970, 1, 1, tzinfo=timezone.utc)
 
-_cache: dict[tuple, "SiteInfo"] = {}
+_cache: dict[tuple, SiteInfo] = {}
 _CACHE_MAX = 512
 
-# 历史库查询节流：浏览器运行时 History 常被独占锁，一次查询可能阻塞数百毫秒，
-# 限制同一浏览器进程的查询频率，避免 GUI 刷新线程被反复拖住
+# 历史库查询节流：限制同一浏览器进程的查询频率，避免频繁触发磁盘 I/O
 _last_db_query: dict[str, float] = {}
 _DB_QUERY_MIN_INTERVAL = 3.0
+_ctx = threading.local()
 
 
 def _db_query_due(proc: str) -> bool:
@@ -42,7 +57,7 @@ def _db_query_due(proc: str) -> bool:
     return False
 
 
-def _cache_put(key: tuple, value: "SiteInfo") -> "SiteInfo":
+def _cache_put(key: tuple, value: SiteInfo) -> SiteInfo:
     if len(_cache) >= _CACHE_MAX and key not in _cache:
         # 简单 FIFO 上限：先入先出丢弃，避免长会话无限涨内存
         _cache.pop(next(iter(_cache)), None)
@@ -76,7 +91,7 @@ def _domain_of(url: str) -> str:
 
 
 def _copy_readable(src: Path) -> str:
-    """把可能被浏览器占用的历史库复制到临时文件，避免文件锁。"""
+    """把可能被浏览器占用的历史库复制到临时文件，作为只读打开失败后的最终兜底。"""
     fd, tmp = tempfile.mkstemp(suffix=".sqlite")
     os.close(fd)
     try:
@@ -90,15 +105,51 @@ def _copy_readable(src: Path) -> str:
         return ""
 
 
-def _open_ro(path: Path):
-    """优先直接只读打开数据库，避免复制大文件；失败返回 None。"""
+def _sqlite_file_uri(path: Path, query: str) -> str:
+    encoded = quote(path.resolve().as_posix(), safe=":/")
+    return f"file:{encoded}?{query}"
+
+
+def _query_history_rows(db_path: Path, sql: str, params: tuple) -> list:
+    """读取浏览器历史库：优先只读直连 → immutable 零拷贝绕锁 → 临时文件复制兜底。
+
+    Chrome/Edge 运行时通常会独占锁住 ``History``（动辄数十上百 MB）。先尝试
+    ``mode=ro&immutable=1`` 可直接从系统页缓存零拷贝读取（<1ms），避免每 3 秒向
+    ``%TEMP%`` 拷贝整库；仅当恰好撞上浏览器页面写入导致校验失败时才退化到文件拷贝。
+    """
+    for query in ("mode=ro", "mode=ro&immutable=1"):
+        conn = None
+        try:
+            conn = sqlite3.connect(_sqlite_file_uri(db_path, query), uri=True, timeout=0.15)
+            return conn.execute(sql, params).fetchall()
+        except Exception:
+            pass
+        finally:
+            if conn is not None:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+
+    tmp = _copy_readable(db_path)
+    if not tmp:
+        return []
+    conn = None
     try:
-        # timeout=0.2：浏览器运行时会独占锁住 History 文件，sqlite 默认
-        # busy 超时 5 秒会让 GUI 主线程每 2 秒卡死一次（界面“冻结”），
-        # 这里用短超时快速放弃，走标题兜底
-        return sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=0.2)
+        conn = sqlite3.connect(_sqlite_file_uri(Path(tmp), "mode=ro"), uri=True, timeout=0.2)
+        return conn.execute(sql, params).fetchall()
     except Exception:
-        return None
+        return []
+    finally:
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception:
+                pass
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
 
 
 def _now_chromium_micros() -> int:
@@ -109,23 +160,49 @@ def _now_firefox_micros() -> int:
     return int((datetime.now(timezone.utc) - _UNIX_EPOCH).total_seconds() * 1_000_000)
 
 
-def _history_candidates() -> list[Path]:
+def _chromium_user_data_dirs(proc: str) -> list[Path]:
     local = Path(os.environ.get("LOCALAPPDATA", ""))
+    roaming = Path(os.environ.get("APPDATA", ""))
+    mapping: dict[str, list[Path]] = {
+        "chrome.exe": [local / "Google" / "Chrome" / "User Data"],
+        "msedge.exe": [local / "Microsoft" / "Edge" / "User Data"],
+        "brave.exe": [local / "BraveSoftware" / "Brave-Browser" / "User Data"],
+        "vivaldi.exe": [local / "Vivaldi" / "User Data"],
+        "arc.exe": [local / "Arc" / "User Data"],
+        "centbrowser.exe": [local / "CentBrowser" / "User Data"],
+        "chromium.exe": [local / "Chromium" / "User Data"],
+        "qqbrowser.exe": [local / "Tencent" / "QQBrowser" / "User Data"],
+        "360chrome.exe": [local / "360Chrome" / "Chrome" / "User Data"],
+        "360se.exe": [roaming / "360se6" / "User Data"],
+        "opera.exe": [
+            roaming / "Opera Software" / "Opera Stable",
+            roaming / "Opera Software" / "Opera GX Stable",
+        ],
+    }
+    if proc in mapping:
+        return mapping[proc]
+    return [
+        local / "Google" / "Chrome" / "User Data",
+        local / "Microsoft" / "Edge" / "User Data",
+    ]
+
+
+def _history_candidates(process_name: str = "") -> list[Path]:
+    proc = (process_name or "").lower()
     found: list[Path] = []
-    for base in (local / "Google" / "Chrome" / "User Data",
-                 local / "Microsoft" / "Edge" / "User Data"):
+    for base in _chromium_user_data_dirs(proc):
         try:
             base_ok = base.exists()
         except OSError:
-            continue  # 目录被锁/无权限时跳过，避免采集线程崩溃
+            continue
         if not base_ok:
             continue
-        profiles = [base / "Default"]
         try:
             extra = sorted(base.glob("Profile*"), key=lambda p: p.stat().st_mtime, reverse=True)
         except OSError:
             extra = []
-        profiles += extra
+        # Opera 等浏览器直接把 History 放在根目录；常规 Chromium 放在 Default / Profile*
+        profiles = [base / "Default"] + extra + [base]
         for profile in profiles:
             h = profile / "History"
             try:
@@ -138,18 +215,28 @@ def _history_candidates() -> list[Path]:
 
 
 def _firefox_places() -> list[Path]:
-    base = Path(os.environ.get("APPDATA", "")) / "Mozilla" / "Firefox" / "Profiles"
-    try:
-        profiles = sorted(base.glob("*"), key=lambda p: p.stat().st_mtime, reverse=True)
-    except OSError:
-        return []
-    result = []
-    for p in profiles:
+    roaming = Path(os.environ.get("APPDATA", ""))
+    bases = (
+        roaming / "Mozilla" / "Firefox" / "Profiles",
+        roaming / "Waterfox" / "Profiles",
+        roaming / "librewolf" / "Profiles",
+        roaming / "zen" / "Profiles",
+    )
+    result: list[Path] = []
+    for base in bases:
         try:
-            if (p / "places.sqlite").exists():
-                result.append(p / "places.sqlite")
+            if not base.exists():
+                continue
+            profiles = sorted(base.glob("*"), key=lambda p: p.stat().st_mtime, reverse=True)
         except OSError:
             continue
+        for p in profiles:
+            try:
+                cand = p / "places.sqlite"
+                if cand.exists() and cand not in result:
+                    result.append(cand)
+            except OSError:
+                continue
     return result
 
 
@@ -159,8 +246,9 @@ def _match_rows(rows, window_title: str) -> SiteInfo | None:
         return None
     for url, title, _ in rows:
         if not url or url.startswith((
-                "chrome://", "edge://", "about:", "chrome-extension://",
-                "edge-extension://", "view-source:", "devtools://")):
+                "chrome://", "edge://", "brave://", "vivaldi://", "opera://",
+                "about:", "chrome-extension://", "edge-extension://",
+                "view-source:", "devtools://")):
             continue
         got = _normalize(title)
         if not got:
@@ -173,71 +261,32 @@ def _match_rows(rows, window_title: str) -> SiteInfo | None:
 
 def _resolve_chromium(window_title: str) -> SiteInfo | None:
     since = _now_chromium_micros() - 20 * 60 * 1_000_000
-    for history in _history_candidates():
-        conn = _open_ro(history)
-        tmp = ""
-        if conn is None:
-            tmp = _copy_readable(history)
-            if not tmp:
-                continue
-            conn = sqlite3.connect(f"file:{tmp}?mode=ro", uri=True, timeout=0.2)
-        try:
-            rows = conn.execute(
-                "SELECT u.url, u.title, v.visit_time FROM urls u "
-                "JOIN visits v ON v.url = u.id "
-                "WHERE v.visit_time >= ? ORDER BY v.visit_time DESC LIMIT 300",
-                (since,),
-            ).fetchall()
-            info = _match_rows(rows, window_title)
-            if info:
-                return info
-        except Exception:
-            pass
-        finally:
-            try:
-                conn.close()
-            except Exception:
-                pass
-            if tmp:
-                try:
-                    os.remove(tmp)
-                except OSError:
-                    pass
+    proc = getattr(_ctx, "proc", "")
+    sql = (
+        "SELECT u.url, u.title, v.visit_time FROM urls u "
+        "JOIN visits v ON v.url = u.id "
+        "WHERE v.visit_time >= ? ORDER BY v.visit_time DESC LIMIT 300"
+    )
+    for history in _history_candidates(proc):
+        rows = _query_history_rows(history, sql, (since,))
+        info = _match_rows(rows, window_title)
+        if info:
+            return info
     return None
 
 
 def _resolve_firefox(window_title: str) -> SiteInfo | None:
     since = _now_firefox_micros() - 20 * 60 * 1_000_000
+    sql = (
+        "SELECT p.url, p.title, h.visit_date FROM moz_places p "
+        "JOIN moz_historyvisits h ON h.place_id = p.id "
+        "WHERE h.visit_date >= ? ORDER BY h.visit_date DESC LIMIT 300"
+    )
     for places in _firefox_places():
-        conn = _open_ro(places)
-        tmp = ""
-        if conn is None:
-            tmp = _copy_readable(places)
-            if not tmp:
-                continue
-            conn = sqlite3.connect(f"file:{tmp}?mode=ro", uri=True, timeout=0.2)
-        try:
-            rows = conn.execute(
-                "SELECT p.url, p.title, h.visit_date FROM moz_places p "
-                "JOIN moz_historyvisits h ON h.place_id = p.id "
-                "WHERE h.visit_date >= ? ORDER BY h.visit_date DESC LIMIT 300",
-                (since,),
-            ).fetchall()
-            info = _match_rows(rows, window_title)
-            if info:
-                return info
-        except Exception:
-            pass
-        finally:
-            try:
-                conn.close()
-            except Exception:
-                pass
-            if tmp:
-                try:
-                    os.remove(tmp)
-                except OSError:
-                    pass
+        rows = _query_history_rows(places, sql, (since,))
+        info = _match_rows(rows, window_title)
+        if info:
+            return info
     return None
 
 
@@ -251,7 +300,7 @@ def resolve_site(process_name: str, window_title: str) -> SiteInfo:
     if not title.strip():
         return _cache_put(key, SiteInfo())
 
-    is_browser = proc in CHROME_EDGE or proc in FIREFOX
+    is_browser = proc in CHROMIUM_BROWSERS or proc in FIREFOX_BROWSERS
     if not is_browser:
         return _cache_put(key, _title_fallback(title))
 
@@ -260,7 +309,11 @@ def resolve_site(process_name: str, window_title: str) -> SiteInfo:
     if not _db_query_due(proc):
         return _title_fallback(title)
 
-    result = _resolve_chromium(title) if proc in CHROME_EDGE else _resolve_firefox(title)
+    _ctx.proc = proc
+    try:
+        result = _resolve_chromium(title) if proc in CHROMIUM_BROWSERS else _resolve_firefox(title)
+    finally:
+        _ctx.proc = ""
     if result:
         return _cache_put(key, result)
     # 查过库仍匹配不到（隐私模式、历史被清空等）：标题兜底并缓存

@@ -25,6 +25,7 @@ DEFAULTS = {
     "poll_interval_seconds": 1.0,   # 前台窗口采样间隔（秒）
     "min_session_seconds": 3,       # 低于该时长的小片段不记录
     "checkpoint_seconds": 45.0,     # 长会话每隔该时长落盘一段，防强杀/断电丢数据
+    "idle_timeout_seconds": 0,      # 键鼠无操作超过该秒数暂停计时，0 = 不启用
     "exclude_processes": [],        # 不想统计的进程名列表，如 ["explorer.exe"]
     "browser_site_tracking": True,  # 识别浏览器当前访问的具体网站
     "data_dir": "data",             # SQLite 数据目录
@@ -163,20 +164,21 @@ def normalize_config(raw) -> tuple[dict, list[str]]:
             )
         cfg[key] = value
 
-    # ---- 历史保留天数（非负整数，0 = 永久保留） ----
-    if "retention_days" in raw:
-        value, ok = _as_float(raw["retention_days"], 0.0)
+    # ---- 非负整数项（历史保留天数 / 空闲暂停秒数，0 = 关闭） ----
+    for key in ("retention_days", "idle_timeout_seconds"):
+        if key not in raw:
+            continue
+        value, ok = _as_float(raw[key], 0.0)
         if not ok:
             problems.append(
-                f"retention_days={raw['retention_days']!r} 不是有效数字，"
-                f"已回退 0（永久保留）"
+                f"{key}={raw[key]!r} 不是有效数字，已回退 0"
             )
-            cfg["retention_days"] = 0
+            cfg[key] = 0
         else:
-            days = max(0, int(value))
-            if days != value:
-                problems.append(f"retention_days={value:g} 已取整为 {days} 天")
-            cfg["retention_days"] = days
+            ival = max(0, int(value))
+            if ival != value:
+                problems.append(f"{key}={value:g} 已规整为非负整数 {ival}")
+            cfg[key] = ival
 
     # ---- 进程排除列表 ----
     if "exclude_processes" in raw:
@@ -224,7 +226,7 @@ def load_config_detailed(path: Path, *, logger=None) -> tuple[dict, list[str]]:
         return _defaults(), []
 
     try:
-        with open(path, "r", encoding="utf-8") as f:
+        with open(path, encoding="utf-8") as f:
             raw = json.load(f)
     except (OSError, ValueError) as exc:
         message = f"配置文件 {path} 读取失败（{exc}），本次使用默认配置"
@@ -248,3 +250,13 @@ def project_root() -> Path:
     if getattr(sys, "frozen", False):
         return Path(sys.executable).resolve().parent
     return Path(__file__).resolve().parent.parent
+
+
+def resource_path(*parts: str) -> Path:
+    """静态资源路径：兼容 PyInstaller ``_MEIPASS`` 与源码目录。"""
+    meipass = getattr(sys, "_MEIPASS", None)
+    if meipass:
+        cand = Path(meipass).joinpath(*parts)
+        if cand.exists():
+            return cand
+    return project_root().joinpath(*parts)

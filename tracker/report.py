@@ -53,7 +53,7 @@ def generate_today_chart(db: UsageDB, output_path, top_n: int = 10):
         seconds = [d["seconds"] for d in shown][::-1]
         max_sec = max(seconds)
         bars = ax_bar.barh(names, seconds, color=plt.cm.tab10(range(len(shown))))
-        for bar, sec in zip(bars, seconds):
+        for bar, sec in zip(bars, seconds, strict=False):
             ax_bar.text(
                 bar.get_width() + max_sec * 0.01, bar.get_y() + bar.get_height() / 2,
                 fmt_duration(sec), va="center", fontsize=9,
@@ -100,7 +100,7 @@ def generate_week_chart(db: UsageDB, output_path, days: int = 7, top_n: int = 6)
                 day_key = (start + timedelta(days=i)).strftime("%Y-%m-%d")
                 vals.append(breakdown.get(day_key, {}).get(proc, 0.0) / 3600.0)
             ax.bar(dates, vals, bottom=bottom, label=proc, width=0.62)
-            bottom = [b + v for b, v in zip(bottom, vals)]
+            bottom = [b + v for b, v in zip(bottom, vals, strict=False)]
 
         day_totals, others_vals = [], []
         for i in range(days):
@@ -110,7 +110,7 @@ def generate_week_chart(db: UsageDB, output_path, days: int = 7, top_n: int = 6)
             others_vals.append(max(0.0, day_total - bottom[i]))
         if any(v > 0.05 for v in others_vals):
             ax.bar(dates, others_vals, bottom=bottom, label="其他", width=0.62, color="#bdbdbd")
-            bottom = [b + v for b, v in zip(bottom, others_vals)]
+            bottom = [b + v for b, v in zip(bottom, others_vals, strict=False)]
         for i, total in enumerate(day_totals):
             if total > 0:
                 ax.text(i, total + 0.25, f"{total:.1f}h", ha="center", fontsize=9)

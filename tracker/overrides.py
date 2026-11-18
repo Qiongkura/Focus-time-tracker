@@ -35,7 +35,7 @@ def load_overrides(path: Path | None = None) -> dict[str, str]:
     if not path.exists():
         return result
     try:
-        with open(path, "r", encoding="utf-8") as f:
+        with open(path, encoding="utf-8") as f:
             raw = json.load(f)
     except Exception:
         return result
